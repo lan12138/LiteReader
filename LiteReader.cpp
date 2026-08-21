@@ -10,6 +10,7 @@
 #include <vector>                    // 动态数组（文本行、token、文档等）
 #include <set>                       // 关键字集合（O(log n) 查找）
 #include <algorithm>                 // std::max 等
+#include <map>                        // std::map（行渲染缓存）
 #include <cwctype>                   // iswupper / iswalnum / iswdigit（宽字符版）
 #include <cwchar>                    // 宽字符处理
 #include <cstdio>                    // _snwprintf 等
@@ -20,12 +21,19 @@
 // 标签栏布局常量
 // ----------------------------------------------------------------------------
 const int TAB_H   = 26;   // 标签栏高度（像素）
-const int TAB_W   = 160;  // 每个标签宽度（像素）
+const int TAB_W   = 160;  // 标签默认宽度（现改为按名称动态计算，此常量仅作后备）
 const int TAB_X0  = 0;    // 第一个标签起始 x 坐标
-const int PLUS_W  = 24;   // 右上角“新建标签”按钮宽度
+const int PLUS_W  = 24;   // 右上角“新建标签”按钮宽度（固定钉在最右）
+const int TAB_W_MIN = 120; // 单个标签最小宽度（像素）
+const int TAB_W_MAX = 320; // 单个标签最大宽度（像素），超过则末尾省略号兜底
+const int TAB_CLOSE_W = 18;// 标签内关闭按钮宽度（像素）
+const int TAB_PAD    = 12; // 标签文字左右内边距合计（左6 + 右6），用于动态宽度估算
 
 // 左侧文件夹浏览器（VSCode 风格）布局常量
-const int SIDEBAR_W      = 240; // 侧栏宽度（像素）；未打开文件夹时为 0
+const int SIDEBAR_W      = 240; // 侧栏默认宽度（像素）；未打开文件夹时为 0
+const int SIDEBAR_W_MIN  = 140; // 侧栏可调最小宽度
+const int SIDEBAR_W_MAX  = 560; // 侧栏可调最大宽度
+const int SIDEBAR_RESIZE_AREA = 5; // 侧栏右缘拖动调宽命中宽度（像素）
 const int SIDEBAR_ROW_H  = 22;  // 树每行高度
 const int SIDEBAR_HEAD_H = 30;  // 侧栏顶部标题栏高度
 const int SIDEBAR_INDENT = 16;  // 每级缩进像素
@@ -62,6 +70,8 @@ std::vector<int>  g_lineInBlock;     // 每一行起始是否处于 <script>(1)/
 std::vector<wchar_t> g_lineBsQ;      // 每一行起始处的块字符串引号（python 的三引号 """）
 std::vector<int> g_lineLen;          // 每一行长度（字符数，不含换行符）
 int g_lineCount = 0;                 // 总行数
+std::vector<int> g_lineW;            // 每一行像素宽缓存（避免每次交互全文件重算行宽）
+int g_maxLineW = 0;                  // 全局最大行宽（用于水平滚动范围，缓存）
 
 // 语法 token 缓存：每行解析出来的着色片段
 enum TokType { T_TEXT=0, T_KEYWORD, T_TYPE, T_STRING, T_COMMENT, T_NUMBER,
@@ -70,12 +80,14 @@ enum TokType { T_TEXT=0, T_KEYWORD, T_TYPE, T_STRING, T_COMMENT, T_NUMBER,
 struct Token { int start; int len; unsigned char type; unsigned char col; }; // col 用于括号彩虹色索引
 std::vector<std::vector<Token>> g_tokens;   // 每行的 token 列表（懒缓存，见 lineTokens）
 std::vector<bool> g_tokDone;               // 对应行是否已经解析过 token
+std::vector<Token> g_emptyToks;            // 空 token 列表（纯文本模式占位，避免每行临时构造）
 
 // 视图（全局共享，跨标签保持一致）
 bool g_dark = true;   // 默认深色模式
 bool g_wrap = false;  // 是否自动换行
 int  g_fontSize = 14; // 字号
-HFONT g_hFont = NULL; // 当前字体句柄
+HFONT g_hFont = NULL; // 当前字体句柄（主编辑框，随 Ctrl+滚轮 变化）
+HFONT g_sideFont = NULL; // 侧栏（文件夹列表）专用字体，固定字号，不随编辑器字号变化
 int  g_charW = 8, g_lineH = 20;   // 单个字符像素宽、单行像素高（measureFont 时测算）
 int  g_gutterW = 56;              // 左侧行号区宽度
 int  g_topLine = 0;     // 第一条可见“视觉行”的索引（垂直滚动位置）
@@ -91,6 +103,21 @@ int  g_matchAw = 1, g_matchBw = 1;    // 配对区间长度（字符括号=1，B
 struct Visual { int line; int col; int len; };
 std::vector<Visual> g_visual;
 int g_visualCount = 0;
+
+// 行渲染缓存：把每个可见视觉行（非选中状态）的文本与语法着色一次性渲染到离屏位图，
+// 后续帧（尤其是拖选/滚动）直接 BitBlt，避免对全屏可见行反复逐段 ExtTextOut（着色卡顿主因）。
+struct LineBmp { HDC dc; HBITMAP bmp; int w; int ver; bool cached; };
+std::map<int,LineBmp> g_lineBmp;        // key = 视觉行号 v
+int g_renderVer = 0;                    // 内容/字体/主题/换行变化时自增，使所有缓存失效
+HDC g_hdcScreen = NULL;                 // 兼容 DC 参照（首次使用时创建）
+const int LINE_BMP_CAP = 4096;          // 单行位图最大像素宽（超长行不缓存，回退直绘），限制内存
+const int LINE_BMP_MAX = 192;           // 缓存行数上限（约等于可见行数），超出淘汰最旧一行
+void invalidateLineCache();             // 释放全部行缓存并使版本号失效
+void renderLineBase(HDC hdc, int v);    // 把视觉行 v 的非选中文本+语法着色渲染到 hdc 的 (0,0)
+void drawLineDirect(HDC hdc, int v, int x, int y, int clipR); // 超长行回退：原始逐段绘制
+void drawLineOverlay(HDC hdc, int v, int x, int y, int clipR); // 选中/匹配/标记覆盖层
+bool lineNeedsOverlay(int base, int len); // 该行是否落在选中/匹配/标记范围内
+LineBmp& getLineBmp(int v);             // 取（或渲染并缓存）视觉行 v 的离屏位图
 
 std::wstring g_filePath;             // 当前文档的磁盘路径
 std::wstring g_lang = L"auto";       // 语言选择（auto / txt / csharp / ...）
@@ -110,9 +137,14 @@ std::set<std::wstring> KW_CS, KW_SQL, KW_JS, KW_PY, KW_CSS, TY_CS,
 // ----------------------------------------------------------------------------
 // 多文档（标签）
 // ----------------------------------------------------------------------------
+// 撤销/重做：操作式历史。每个 EditStep 记录“被替换区间起点、删除串、插入串”，
+// 撤销=删除插入串并重填删除串；重做=反之。比“整篇快照”省内存，适合大文件逐字编辑。
+struct EditStep { int start; std::wstring del; std::wstring ins; };
+
 struct Doc {
   std::wstring text;                          // 该文档的文本内容
-  std::vector<int> lineStart, lineLen, lineDepth;
+  std::vector<int> lineStart, lineLen, lineDepth, lineW;
+  int maxLineW = 0;
   std::vector<bool> lineInBC;                 // 注意：结构体里用的是 lineInBC，全局里也叫 lineInBC
   std::vector<bool> lineInSrv;
   std::vector<wchar_t> lineBsQ;
@@ -127,9 +159,16 @@ struct Doc {
   int visualCount = 0;
   bool dirty = false;                         // 该文档是否已修改（未保存）
   std::wstring title;                         // 预留标题字段（当前用 filePath 派生，未单独使用）
+  // 撤销/重做栈（操作式历史），按文档保存，切换标签时随快照迁移
+  std::vector<EditStep> undoStack;
+  std::vector<EditStep> redoStack;
 };
 std::vector<Doc> g_docs;          // 所有打开的文档
 int g_active = -1;                // 当前激活标签索引
+
+// 撤销/重做栈（操作式历史，定义见上方 EditStep）。随 snapshotTo/restoreFrom 在文档间迁移。
+std::vector<EditStep> g_undoStack; // 当前激活文档的撤销栈
+std::vector<EditStep> g_redoStack; // 当前激活文档的重做栈
 
 // 把当前“全局视图状态”快照保存到文档 i（切换标签前先调用，避免丢失当前页状态）
 void snapshotTo(int i){
@@ -137,11 +176,13 @@ void snapshotTo(int i){
   Doc& d=g_docs[i];
   d.text=g_text; d.lineStart=g_lineStart; d.lineLen=g_lineLen; d.lineDepth=g_lineDepth;
   d.lineInBC=g_lineInBC; d.lineInSrv=g_lineInSrv; d.lineBsQ=g_lineBsQ; d.tokens=g_tokens; d.tokDone=g_tokDone;
+  d.lineW=g_lineW; d.maxLineW=g_maxLineW;
   d.lineCount=g_lineCount; d.filePath=g_filePath; d.lang=g_lang; d.langId=g_langId;
   d.caretOff=g_caretOff; d.anchorOff=g_anchorOff; d.selStart=g_selStart; d.selEnd=g_selEnd;
   d.matchA=g_matchA; d.matchB=g_matchB; d.matchAw=g_matchAw; d.matchBw=g_matchBw; d.topLine=g_topLine; d.scrollX=g_scrollX;
   d.dirty=g_dirty;
   d.visual=g_visual; d.visualCount=g_visualCount;
+  d.undoStack=g_undoStack; d.redoStack=g_redoStack;
 }
 // 从文档 i 恢复“全局视图状态”（切换标签进来时调用）
 void restoreFrom(int i){
@@ -149,11 +190,14 @@ void restoreFrom(int i){
   const Doc& d=g_docs[i];
   g_text=d.text; g_lineStart=d.lineStart; g_lineLen=d.lineLen; g_lineDepth=d.lineDepth;
   g_lineInBC=d.lineInBC; g_lineInSrv=d.lineInSrv; g_lineBsQ=d.lineBsQ; g_tokens=d.tokens; g_tokDone=d.tokDone;
+  g_lineW=d.lineW; g_maxLineW=d.maxLineW;
   g_lineCount=d.lineCount; g_filePath=d.filePath; g_lang=d.lang; g_langId=d.langId;
   g_caretOff=d.caretOff; g_anchorOff=d.anchorOff; g_selStart=d.selStart; g_selEnd=d.selEnd;
   g_matchA=d.matchA; g_matchB=d.matchB; g_matchAw=d.matchAw; g_matchBw=d.matchBw; g_topLine=d.topLine; g_scrollX=d.scrollX;
   g_dirty=d.dirty;
   g_visual=d.visual; g_visualCount=d.visualCount;
+  g_undoStack=d.undoStack; g_redoStack=d.redoStack;
+  invalidateLineCache();   // 切换标签后内容已变，行缓存失效
 }
 
 // ----------------------------------------------------------------------------
@@ -266,11 +310,25 @@ int linePrefixPx(int line, int col){
   for(int i=s;i<n;i++) w+=charW(g_text[i]);
   return w;
 }
-// 整行像素宽度（遍历该行所有字符累加）
+// 整行像素宽度：优先用缓存 g_lineW（O(1)），缓存未建立时回退遍历
 int linePx(int line){
+  if(line>=0 && line<(int)g_lineW.size()) return g_lineW[line];
   int s=g_lineStart[line], n=s+g_lineLen[line], w=0;
   for(int i=s;i<n;i++) w+=charW(g_text[i]);
   return w;
+}
+// 重算每行像素宽与全局最大宽：仅载入/编辑/字号变化时调用一次，
+// 之后缩放、滚动、绘制均直接查表，避免大文件上每次交互全文件 O(n) 扫描（卡顿主因）。
+void recomputeLineW(){
+  int n=g_lineCount;
+  g_lineW.assign(n,0);
+  int mx=0;
+  for(int l=0;l<n;l++){
+    int s=g_lineStart[l], e=s+g_lineLen[l], w=0;
+    for(int i=s;i<e;i++) w+=charW(g_text[i]);
+    g_lineW[l]=w; if(w>mx)mx=w;
+  }
+  g_maxLineW=mx;
 }
 // 字符段 [start,start+len) 的像素宽度
 int runPx(int start, int len){
@@ -683,7 +741,9 @@ void scanLine(const wchar_t* s, int n, Lang lang, bool& inBC, int& inBlock, bool
 // ----------------------------------------------------------------------------
 // 根据当前字号与屏幕 DPI 创建等宽字体，并测量出真实字符宽/行高。
 // 用整串文本宽度求平均字符宽，比系统 tmAveCharWidth 更准确，避免长行偏移累积。
+void ensureSideFont(); // 前向声明（定义在 ensureFont 之后）
 void ensureFont(){
+  invalidateLineCache();   // 字体/字号即将变化，先释放所有行缓存，避免旧字体句柄悬空
   if(g_hFont) DeleteObject(g_hFont);
   HDC hdc=GetDC(g_hwnd);
   int h=-MulDiv(g_fontSize,GetDeviceCaps(hdc,LOGPIXELSY),72); // 字号(pt)转设备像素高度（取负表示字符高度）
@@ -702,11 +762,28 @@ void ensureFont(){
   if(g_charW<1) g_charW=tm.tmAveCharWidth;
   g_lineH = tm.tmHeight + tm.tmExternalLeading + 2;
   ReleaseDC(g_hwnd,hdc);
+  recomputeLineW(); // 字号/字体变化后像素宽随之变化，重算行宽缓存
+  ensureSideFont(); // 侧栏字体固定，但需确保已创建（首次）
+}
+
+// 侧栏（文件夹列表）字体：固定字号，不随主编辑框的 Ctrl+滚轮 缩放而变化。
+void ensureSideFont(){
+  if(g_sideFont) return;          // 只创建一次
+  HDC hdc=GetDC(g_hwnd);
+  int h=-MulDiv(12,GetDeviceCaps(hdc,LOGPIXELSY),72); // 固定 12pt
+  LOGFONT lf={0};
+  lf.lfHeight=h; lf.lfWeight=FW_NORMAL; lf.lfCharSet=DEFAULT_CHARSET;
+  wcscpy_s(lf.lfFaceName,L"Segoe UI");
+  g_sideFont=CreateFontIndirect(&lf);
+  if(!g_sideFont){ wcscpy_s(lf.lfFaceName,L"Microsoft YaHei"); g_sideFont=CreateFontIndirect(&lf); }
+  if(!g_sideFont){ wcscpy_s(lf.lfFaceName,L"Tahoma");         g_sideFont=CreateFontIndirect(&lf); }
+  ReleaseDC(g_hwnd,hdc);
 }
 
 // 重新切分行为“逻辑行”数组，并用 scanLine(out=nullptr) 计算每一行起始的跨行状态
 // （块注释/括号深度/ASPX 服务端块/块字符串引号），供后续 lineTokens 正确续行着色。
 void rebuildLines(){
+  invalidateLineCache();   // 文本内容即将改变，行缓存全部失效
   g_lineStart.clear(); g_lineLen.clear(); g_lineDepth.clear();
   g_lineInBC.clear(); g_lineInSrv.clear(); g_lineInBlock.clear(); g_lineBsQ.clear();
   g_tokens.clear(); g_tokDone.clear();
@@ -734,6 +811,7 @@ void rebuildLines(){
   }
   g_tokens.assign(g_lineCount, std::vector<Token>()); // 重置 token 缓存
   g_tokDone.assign(g_lineCount,false);
+  recomputeLineW(); // 一次性算好每行像素宽与最大行宽（载入/编辑后各调用一次）
 }
 
 // 获取第 l 行的 token 列表；若尚未解析则懒解析（利用该行已存好的起始状态续行着色）。
@@ -761,10 +839,13 @@ void buildVisual(){
   if(avail<g_charW) avail=g_charW;
   for(int l=0;l<g_lineCount;l++){
     int len=g_lineLen[l];
-    int pw=linePx(l);
-    if(!g_wrap || pw<=avail){
-      g_visual.push_back({l,0,len}); // 整行作为一个视觉行
+    if(!g_wrap){                        // 非换行：视觉行与窗口宽度无关，整行直接作为一个视觉行
+      g_visual.push_back({l,0,len});
     } else {
+      int pw=(l<(int)g_lineW.size())? g_lineW[l] : linePx(l); // 换行：用缓存行宽判断是否需切分
+      if(pw<=avail){
+        g_visual.push_back({l,0,len}); // 整行作为一个视觉行
+      } else {
       int start=0;
       while(start<len){
         int col=start, ww=0;
@@ -775,6 +856,7 @@ void buildVisual(){
         }
         g_visual.push_back({l,start,col-start}); // 视觉行：所属逻辑行、起始列、长度
         start=col;
+      }
       }
     }
   }
@@ -912,8 +994,7 @@ void updateScroll(){
   SCROLLINFO si={sizeof(si)};
   si.fMask=SIF_ALL; si.nMin=0; si.nMax=g_visualCount-1; si.nPage=visH; si.nPos=g_topLine;
   SetScrollInfo(g_hwnd,SB_VERT,&si,TRUE);
-  int maxX=0;
-  for(int l=0;l<g_lineCount;l++){ int w=linePx(l); if(w>maxX)maxX=w; } // 最长行的像素宽
+  int maxX=g_maxLineW; // 最长行的像素宽（缓存，避免每次滚动全量扫描）
   int clientW=r.right-r.left;
   int hmax=maxX-(clientW-leftBar()-g_gutterW); // 最大水平滚动量 = 最长行宽 - 可视文本宽
   if(hmax<0)hmax=0;
@@ -949,8 +1030,18 @@ int g_sideHoverBtn=0;               // 侧栏头部按钮悬停（1=关闭×）
 bool g_treeDrag=false;              // 是否正在拖动树滚动条滑块
 int  g_treeDragGrab=0;              // 拖动时鼠标与滑块顶部的偏移
 
+// 侧栏拖拽调宽状态
+int  g_sidebarW = SIDEBAR_W;        // 侧栏当前宽度（可被鼠标拖动调整）
+bool g_sidebarResizing=false;      // 是否正在拖动侧栏右缘调宽
+int  g_sidebarResizeStartX=0;      // 拖拽起始鼠标 x
+int  g_sidebarResizeStartW=0;      // 拖拽起始侧栏宽度
+
+// 标签栏水平滚动偏移（标签总宽超过可视区时，让当前标签可见）
+int g_tabScroll=0;
+int g_ctxTab=-1; // 右键标签菜单所针对的标签索引（在弹出菜单前写入，WM_COMMAND 时读取）
+
 // 左侧栏占用的宽度：未打开文件夹时为 0，编辑器与行号区占满整个客户区
-int leftBar(){ return g_folderOpen?SIDEBAR_W:0; }
+int leftBar(){ return g_folderOpen?g_sidebarW:0; }
 
 // 枚举目录子项：先文件夹后文件，各自按名称排序，结果写入 node.children
 void loadDir(TreeNode& node){
@@ -1111,8 +1202,53 @@ void sidebarMove(int x,int y){
   }
 }
 // 绘制整个侧栏（背景 / 头部 / 树行 / 分隔线 / 滚动条）
+// —— 侧栏文件类型着色辅助 ——
+// 取小写扩展名（不含点）；无扩展名返回空串
+std::wstring fileExtLower(const std::wstring& name){
+  size_t dot=name.find_last_of(L'.');
+  if(dot==std::wstring::npos || dot+1>=name.size()) return L"";
+  std::wstring e=name.substr(dot+1);
+  for(auto& c: e) c=(wchar_t)towlower(c);
+  return e;
+}
+// 扩展名 → 语言类型（仅映射本软件支持的语言；其余返回 L_TXT）
+Lang extToLang(const std::wstring& ext){
+  if(ext==L"cs") return L_CS;
+  if(ext==L"sql") return L_SQL;
+  if(ext==L"html"||ext==L"htm") return L_HTML;
+  if(ext==L"js"||ext==L"mjs"||ext==L"cjs") return L_JS;
+  if(ext==L"json") return L_JSON;
+  if(ext==L"py"||ext==L"pyw") return L_PY;
+  if(ext==L"css") return L_CSS;
+  if(ext==L"c"||ext==L"h") return L_C;
+  if(ext==L"cpp"||ext==L"cc"||ext==L"cxx"||ext==L"hpp"||ext==L"hxx"||ext==L"hh") return L_CPP;
+  if(ext==L"java") return L_JAVA;
+  if(ext==L"aspx"||ext==L"asax"||ext==L"ascx"||ext==L"ashx"||ext==L"asmx"||ext==L"master") return L_ASPX;
+  if(ext==L"xml"||ext==L"xaml"||ext==L"svg"||ext==L"config"||ext==L"csproj"||ext==L"vcxproj"||ext==L"resx") return L_XML;
+  return L_TXT;
+}
+// 语言类型 → 侧栏文件图标/文字颜色（深浅主题各一套）。未知/文本用默认灰。
+COLORREF fileAccent(Lang lg, bool dark){
+  switch(lg){
+    case L_CS:   return dark?RGB(230,180,34):RGB(176,122,40);   // C# 金
+    case L_SQL:  return dark?RGB(122,192,229):RGB(45,125,210);  // SQL 蓝
+    case L_HTML: return dark?RGB(232,118,74):RGB(214,69,43);    // HTML 红橙
+    case L_JS:   return dark?RGB(240,199,58):RGB(180,150,20);   // JS 黄
+    case L_JSON: return dark?RGB(224,179,65):RGB(166,124,0);    // JSON 琥珀
+    case L_PY:   return dark?RGB(111,179,224):RGB(45,110,175);  // Python 蓝
+    case L_CSS:  return dark?RGB(180,140,230):RGB(140,90,200);  // CSS 紫
+    case L_C:    case L_CPP: return dark?RGB(130,165,230):RGB(110,140,210); // C/C++ 蓝
+    case L_JAVA: return dark?RGB(230,160,70):RGB(200,120,30);   // Java 橙
+    case L_ASPX: return dark?RGB(170,140,230):RGB(120,90,200);  // ASPX 紫
+    case L_XML:  return dark?RGB(155,197,90):RGB(110,150,60);   // XML 绿
+    default:     return dark?RGB(157,165,180):RGB(90,90,90);    // 文本/未知：默认灰
+  }
+}
+
 void drawSidebar(HDC mem, const RECT& rc){
   if(!g_folderOpen) return;
+  if(!g_sideFont) ensureSideFont();               // 防御：确保侧栏字体已就绪
+  HGDIOBJ oldSideFnt=SelectObject(mem,g_sideFont); // 侧栏用独立字体，不受编辑器字号影响
   int lb=leftBar();
   int eTop=editorTop();
   // 背景（从标签栏下沿 TAB_H 起，覆盖查找条左侧的留白带，避免缝隙）
@@ -1133,8 +1269,7 @@ void drawSidebar(HDC mem, const RECT& rc){
   DrawText(mem,L"×",1,&cr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
   // 树行
   int sbTop=eTop+SIDEBAR_HEAD_H;
-  COLORREF folderCol = g_dark?0x7BC0E5:0x2D7DD2;
-  COLORREF fileCol   = g_dark?0x9DA5B4:0x5A5A5A;
+  COLORREF folderCol = g_dark?RGB(123,192,229):RGB(45,125,210);  // 文件夹统一用文件夹蓝
   for(size_t i=0;i<g_treeRows.size();i++){
     int y=sbTop+(int)i*SIDEBAR_ROW_H-g_treeScroll;
     if(y+SIDEBAR_ROW_H<sbTop) continue;
@@ -1148,14 +1283,20 @@ void drawSidebar(HDC mem, const RECT& rc){
       FillRect(mem,&rr,hb2); DeleteObject(hb2);
     }
     int indent=10+n->depth*SIDEBAR_INDENT;
+    COLORREF col;
     if(n->isDir){
-      drawTreeTri(mem,indent,y+SIDEBAR_ROW_H/2,n->expanded, g_dark?0x9DA5B4:0x555555);
-      drawFolderIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-12)/2),folderCol);
+      col=folderCol;
+      drawTreeTri(mem,indent,y+SIDEBAR_ROW_H/2,n->expanded, g_dark?RGB(157,165,180):RGB(85,85,85));
+      drawFolderIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-12)/2),col);
     } else {
-      drawFileIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-13)/2),fileCol);
+      col=fileAccent(extToLang(fileExtLower(n->name)), g_dark); // 按文件类型着色
+      drawFileIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-13)/2),col);
     }
     RECT nr={indent+14+16, y, lb-4, y+SIDEBAR_ROW_H};
-    SetTextColor(mem, active?(g_dark?0xFFFFFF:0x000000):(g_dark?0xD0D0D0:0x222222));
+    COLORREF txtCol = active ? (g_dark?RGB(255,255,255):RGB(0,0,0))
+                   : hover  ? (g_dark?RGB(255,255,255):RGB(0,0,0))
+                   : (n->isDir ? (g_dark?RGB(157,165,180):RGB(50,50,50)) : col); // 文件名为类型色，目录为中性灰
+    SetTextColor(mem, txtCol);
     DrawText(mem,n->name.c_str(),(int)n->name.size(),&nr,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
   }
   if(g_treeRows.empty()){
@@ -1175,42 +1316,91 @@ void drawSidebar(HDC mem, const RECT& rc){
     RECT thr={lb-11,thumbY,lb-2,thumbY+thumbH};
     HBRUSH tb=CreateSolidBrush(g_dark?0x00545454:0x00BFBFBF); FillRect(mem,&thr,tb); DeleteObject(tb);
   }
+  SelectObject(mem,oldSideFnt); // 还原缓冲区原字体（主编辑框用 g_hFont）
 }
 
-// 绘制顶部标签栏（各个文档标签 + 新建按钮），覆盖在最上方一行。
+// 取标签 i 的显示标题（文件名最后一段，未命名则“未命名”）
+std::wstring tabTitle(int i){
+  const std::wstring& p=g_docs[i].filePath;
+  if(p.empty()) return L"未命名";
+  std::wstring t=p.substr(p.find_last_of(L'\\')+1);
+  return t.empty()? L"未命名" : t;
+}
+// 按标题文本宽度动态计算标签宽度（含关闭按钮与内边距），限制在 [TAB_W_MIN,TAB_W_MAX]
+int tabWidthFor(int i){
+  std::wstring t=tabTitle(i);
+  HDC hdc=GetDC(g_hwnd); HGDIOBJ of=SelectObject(hdc,g_hFont);
+  SIZE sz; GetTextExtentPoint32(hdc,t.c_str(),(int)t.size(),&sz);
+  SelectObject(hdc,of); ReleaseDC(g_hwnd,hdc);
+  int w=sz.cx + TAB_PAD + TAB_CLOSE_W;   // 左6 + 右6 + 关闭按钮18 = 30
+  if(w<TAB_W_MIN)w=TAB_W_MIN;
+  if(w>TAB_W_MAX)w=TAB_W_MAX;
+  return w;
+}
+// 夹紧标签栏水平滚动范围（总宽超过可视区才允许滚动）
+void clampTabScroll(){
+  RECT rc; GetClientRect(g_hwnd,&rc);
+  int stripRight=rc.right-PLUS_W; if(stripRight<0)stripRight=0;
+  int total=0; for(int i=0;i<(int)g_docs.size();i++) total+=tabWidthFor(i);
+  int maxS=total>stripRight? total-stripRight : 0;
+  if(g_tabScroll<0)g_tabScroll=0;
+  if(g_tabScroll>maxS)g_tabScroll=maxS;
+}
+// 切换/打开/关闭标签后，把当前激活标签滚入可视区
+void ensureActiveTabVisible(){
+  int n=(int)g_docs.size(); if(g_active<0||g_active>=n) return;
+  RECT rc; GetClientRect(g_hwnd,&rc);
+  int stripRight=rc.right-PLUS_W; if(stripRight<0)stripRight=0;
+  int cx=TAB_X0-g_tabScroll, ax=0, aw=0;
+  for(int i=0;i<n;i++){ int w=tabWidthFor(i); if(i==g_active){ax=cx;aw=w;} cx+=w; }
+  if(ax<0) g_tabScroll+=ax;                          // 左缘在可视区左侧外
+  else if(ax+aw>stripRight) g_tabScroll+=(ax+aw-stripRight); // 右缘在可视区右侧外
+  clampTabScroll();
+}
+
+// 绘制顶部标签栏（各文档标签按名称动态宽度 + 新建按钮钉在最右），覆盖在最上方一行。
 void drawTabBar(HDC mem, const RECT& rc){
+  clampTabScroll(); // 窗口变宽后把标签滚回可视区，避免标签“卡”在滚动偏移处
   COLORREF stripBg = g_dark?0x252526:0xF0F0F0;
   HBRUSH sb=CreateSolidBrush(stripBg); FillRect(mem,&rc,sb); DeleteObject(sb);
-  // 标签栏底部分隔线
+  // 标签栏底部分隔线（贯穿到加号按钮左侧）
+  int stripRight=rc.right-PLUS_W; if(stripRight<0)stripRight=0;
   HPEN bp=CreatePen(PS_SOLID,1,g_dark?0x3A3A3A:0xD0D0D0); HPEN op=(HPEN)SelectObject(mem,bp);
-  MoveToEx(mem,0,TAB_H-1,NULL); LineTo(mem,rc.right,TAB_H-1); SelectObject(mem,op); DeleteObject(bp);
+  MoveToEx(mem,0,TAB_H-1,NULL); LineTo(mem,stripRight,TAB_H-1); SelectObject(mem,op); DeleteObject(bp);
 
   int n=(int)g_docs.size();
+  // 裁剪到“标签条带”区域（加号按钮左侧），被滚出左侧的标签不绘制
+  int saved=SaveDC(mem);
+  IntersectClipRect(mem,0,0,stripRight,TAB_H);
+  SetBkMode(mem,TRANSPARENT);
+  int cx=TAB_X0 - g_tabScroll;
   for(int i=0;i<n;i++){
-    int tx=TAB_X0 + i*TAB_W;
-    RECT tr={tx,0,tx+TAB_W,TAB_H};
+    int w=tabWidthFor(i);
+    if(cx+w<=0){ cx+=w; continue; }   // 完全在可视区左侧外，跳过
+    if(cx>=stripRight) break;          // 已超出条带右界，后续不再可见
+    RECT tr={cx,0,cx+w,TAB_H};
     bool act=(i==g_active);
     COLORREF tb = act? (g_dark?0x1E1E1E:0xFFFFFF) : (g_dark?0x2D2D2D:0xE4E4E4); // 激活标签背景更亮
     HBRUSH tbk=CreateSolidBrush(tb); FillRect(mem,&tr,tbk); DeleteObject(tbk);
     if(act){
       // 激活标签底部画一条强调色横线
       HPEN ap=CreatePen(PS_SOLID,2,g_dark?0x569CD6:0x1976D2); HPEN ao=(HPEN)SelectObject(mem,ap);
-      MoveToEx(mem,tx,TAB_H-1,NULL); LineTo(mem,tx+TAB_W,TAB_H-1); SelectObject(mem,ao); DeleteObject(ap);
+      MoveToEx(mem,cx,TAB_H-1,NULL); LineTo(mem,cx+w,TAB_H-1); SelectObject(mem,ao); DeleteObject(ap);
     }
-    // 标签文字：文件名（取路径最后一段），末尾省略号
-    std::wstring t = g_docs[i].filePath.empty()? L"未命名" : g_docs[i].filePath.substr(g_docs[i].filePath.find_last_of(L'\\')+1);
-    RECT tr2={tx+6,0,tx+TAB_W-20,TAB_H};
-    SetBkMode(mem,TRANSPARENT);
+    std::wstring t=tabTitle(i);
+    RECT tr2={cx+6,0,cx+w-TAB_CLOSE_W-6,TAB_H};
     SetTextColor(mem, act? (g_dark?0xFFFFFF:0x000000) : (g_dark?0xC0C0C0:0x555555));
     DrawText(mem,t.c_str(),(int)t.size(),&tr2,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     // 关闭按钮 ×
-    RECT cr={tx+TAB_W-18,4,tx+TAB_W-4,TAB_H-4};
+    RECT cr={cx+w-TAB_CLOSE_W,4,cx+w-4,TAB_H-4};
     SetTextColor(mem, g_dark?0xAAAAAA:0x888888);
     DrawText(mem,L"×",1,&cr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+    cx+=w;
   }
-  // “新建标签”按钮（+）
-  int px=TAB_X0 + n*TAB_W;
-  RECT pr={px+2,2,px+2+PLUS_W,TAB_H-2};
+  RestoreDC(mem,saved);
+
+  // “新建标签”按钮（+）钉在最右侧，始终可见
+  RECT pr={rc.right-PLUS_W,2,rc.right-2,TAB_H-2};
   HBRUSH pb=CreateSolidBrush(g_dark?0x2D2D2D:0xE4E4E4); FillRect(mem,&pr,pb); DeleteObject(pb);
   SetBkMode(mem,TRANSPARENT); SetTextColor(mem, g_dark?0xFFFFFF:0x000000);
   DrawText(mem,L"+",1,&pr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
@@ -1218,156 +1408,352 @@ void drawTabBar(HDC mem, const RECT& rc){
 }
 
 // 主绘制函数：双缓冲（先画到内存 DC，再 BitBlt 到屏幕），避免闪烁。
+// ----------------------------------------------------------------------------
+// 行渲染缓存：把可见行（非选中态）的文本+语法着色先渲染进离屏位图，
+// 之后每帧（尤其拖选/滚动）直接 BitBlt，只在选中/匹配/标记的行上追加覆盖层。
+// 这样把“每帧对全屏可见行反复逐段 ExtTextOut 做语法高亮”降到约“可见行数”次 BitBlt。
+// ----------------------------------------------------------------------------
+void invalidateLineCache(){
+  for(auto& kv:g_lineBmp){
+    if(kv.second.dc) DeleteDC(kv.second.dc);
+    if(kv.second.bmp) DeleteObject(kv.second.bmp);
+  }
+  g_lineBmp.clear();
+  g_renderVer++;
+}
+
+// 把视觉行 v 的“非选中”文本与语法着色渲染到 hdc 的 (0,0) 处（位图局部坐标）。
+void renderLineBase(HDC hdc, int v){
+  const Visual& vis=g_visual[v];
+  int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
+  int w=runPx(base,len); if(w<1)w=1;
+  COLORREF bg=bgColor();
+  SetBkMode(hdc,OPAQUE); SetBkColor(hdc,bg);
+  HBRUSH bgBr=CreateSolidBrush(bg); RECT br={0,0,w,g_lineH}; FillRect(hdc,&br,bgBr); DeleteObject(bgBr);
+  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
+  if(g_langId!=L_TXT){
+    const std::vector<Token>& toks=lineTokens(line);
+    for(const Token& t:toks){ int c0=t.start,c1=t.start+t.len; int lo=std::max(c0,vis.col),hi=std::min(c1,vis.col+len); for(int c=lo;c<hi;c++){ ttype[c-vis.col]=t.type; tcol[c-vis.col]=t.col; } }
+  } else {
+    int depth=g_lineDepth[line];
+    for(int k=0;k<len;k++){ wchar_t c=g_text[base+k]; if(c==L'('||c==L'['||c==L'{'){ ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(depth%6); depth++; } else if(c==L')'||c==L']'||c==L'}'){ int d=depth>0?depth-1:0; ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(d%6); if(depth>0)depth--; } }
+  }
+  int x=0; int k=0;
+  while(k<len){
+    unsigned char ty=ttype[k], tc=tcol[k];
+    int j=k+1;
+    while(j<len && ttype[j]==ty && tcol[j]==tc) j++;
+    int segLen=j-k;
+    COLORREF fg=(ty==T_BRACKET)?(g_dark?RB_DARK[tc]:RB_LIGHT[tc]):pal[ty];
+    SetTextColor(hdc,fg);
+    RECT clip={0,0,w,g_lineH};
+    ExtTextOut(hdc,x,0,ETO_CLIPPED,&clip,g_text.c_str()+base+k,segLen,NULL);
+    x+=runPx(base+k,segLen); k=j;
+  }
+}
+
+// 超长行（位图超过 LINE_BMP_CAP）回退：沿用原始逐段绘制逻辑直接画到目标 DC。
+void drawLineDirect(HDC hdc, int v, int x, int y, int clipR){
+  const Visual& vis=g_visual[v];
+  int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
+  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  COLORREF bg=bgColor();
+  const std::vector<Token>& toks=(g_langId==L_TXT)? g_emptyToks : lineTokens(line);
+  std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
+  if(g_langId!=L_TXT){
+    for(const Token& t:toks){ int c0=t.start,c1=t.start+t.len; int lo=std::max(c0,vis.col),hi=std::min(c1,vis.col+len); for(int c=lo;c<hi;c++){ ttype[c-vis.col]=t.type; tcol[c-vis.col]=t.col; } }
+  } else {
+    int depth=g_lineDepth[line];
+    for(int k=0;k<len;k++){ wchar_t c=g_text[base+k]; if(c==L'('||c==L'['||c==L'{'){ ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(depth%6); depth++; } else if(c==L')'||c==L']'||c==L'}'){ int d=depth>0?depth-1:0; ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(d%6); if(depth>0)depth--; } }
+  }
+  RECT lineClip={leftBar()+g_gutterW, y, clipR, y+g_lineH};
+  int k=0;
+  while(k<len){
+    unsigned char ty=ttype[k], tc=tcol[k];
+    bool sel=(g_selStart>=0 && (base+k)>=g_selStart && (base+k)<g_selEnd);
+    bool mt=((g_matchA>=0 && (base+k)>=g_matchA && (base+k)<g_matchA+g_matchAw)||(g_matchB>=0 && (base+k)>=g_matchB && (base+k)<g_matchB+g_matchBw));
+    bool mk=(base+k<(int)g_markFlag.size())?(g_markFlag[base+k]!=0):false;
+    int j=k+1;
+    while(j<len){
+      bool sel2=(g_selStart>=0 && (base+j)>=g_selStart && (base+j)<g_selEnd);
+      bool mt2=((g_matchA>=0 && (base+j)>=g_matchA && (base+j)<g_matchA+g_matchAw)||(g_matchB>=0 && (base+j)>=g_matchB && (base+j)<g_matchB+g_matchBw));
+      bool mk2=(base+j<(int)g_markFlag.size())?(g_markFlag[base+j]!=0):false;
+      if(sel2!=sel || mt2!=mt || mk2!=mk || ttype[j]!=ty || tcol[j]!=tc) break;
+      j++;
+    }
+    int segLen=j-k;
+    COLORREF fg=(ty==T_BRACKET)?(g_dark?RB_DARK[tc]:RB_LIGHT[tc]):pal[ty];
+    COLORREF bk=bg;
+    if(mt) bk=matchBg(); else if(sel) bk=selBg(); else if(mk) bk=markBg();
+    int runW=runPx(base+k,segLen);
+    if(sel||mt){
+      RECT segR={x-1,y,x+runW+1,y+g_lineH};
+      HBRUSH hb=CreateSolidBrush(bk); FillRect(hdc,&segR,hb); DeleteObject(hb);
+    }
+    SetTextColor(hdc, sel? (g_dark?0xFFFFFF:0x000000) : fg);
+    SetBkColor(hdc,bk);
+    ExtTextOut(hdc,x,y,ETO_CLIPPED,&lineClip,g_text.c_str()+base+k,segLen,NULL);
+    x+=runW; k=j;
+  }
+}
+
+// 仅对落在选中/匹配/标记范围内的行画覆盖层（其余行直接 BitBlt 缓存位图即可）。
+void drawLineOverlay(HDC hdc, int v, int x, int y, int clipR){
+  const Visual& vis=g_visual[v];
+  int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
+  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  COLORREF bg=bgColor();
+  std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
+  if(g_langId!=L_TXT){
+    const std::vector<Token>& toks=lineTokens(line);
+    for(const Token& t:toks){ int c0=t.start,c1=t.start+t.len; int lo=std::max(c0,vis.col),hi=std::min(c1,vis.col+len); for(int c=lo;c<hi;c++){ ttype[c-vis.col]=t.type; tcol[c-vis.col]=t.col; } }
+  } else {
+    int depth=g_lineDepth[line];
+    for(int k=0;k<len;k++){ wchar_t c=g_text[base+k]; if(c==L'('||c==L'['||c==L'{'){ ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(depth%6); depth++; } else if(c==L')'||c==L']'||c==L'}'){ int d=depth>0?depth-1:0; ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(d%6); if(depth>0)depth--; } }
+  }
+  SetBkMode(hdc,OPAQUE);
+  int k=0;
+  while(k<len){
+    bool sel=(g_selStart>=0 && (base+k)>=g_selStart && (base+k)<g_selEnd);
+    bool mt=((g_matchA>=0 && (base+k)>=g_matchA && (base+k)<g_matchA+g_matchAw)||(g_matchB>=0 && (base+k)>=g_matchB && (base+k)<g_matchB+g_matchBw));
+    bool mk=(base+k<(int)g_markFlag.size())?(g_markFlag[base+k]!=0):false;
+    int j=k+1;
+    while(j<len){
+      bool sel2=(g_selStart>=0 && (base+j)>=g_selStart && (base+j)<g_selEnd);
+      bool mt2=((g_matchA>=0 && (base+j)>=g_matchA && (base+j)<g_matchA+g_matchAw)||(g_matchB>=0 && (base+j)>=g_matchB && (base+j)<g_matchB+g_matchBw));
+      bool mk2=(base+j<(int)g_markFlag.size())?(g_markFlag[base+j]!=0):false;
+      if(sel2!=sel || mt2!=mt || mk2!=mk) break;
+      j++;
+    }
+    int segLen=j-k;
+    int runW=runPx(base+k,segLen);
+    COLORREF bk=bg;
+    if(mt) bk=matchBg(); else if(sel) bk=selBg(); else if(mk) bk=markBg();
+    if(bk!=bg){
+      RECT segR={x-1,y,x+runW+1,y+g_lineH};
+      HBRUSH hb=CreateSolidBrush(bk); FillRect(hdc,&segR,hb); DeleteObject(hb);
+    }
+    if(sel){
+      SetTextColor(hdc, g_dark?0xFFFFFF:0x000000); SetBkColor(hdc,bk);
+      RECT lc={leftBar()+g_gutterW,y,clipR,y+g_lineH};
+      ExtTextOut(hdc,x,y,ETO_CLIPPED,&lc,g_text.c_str()+base+k,segLen,NULL);
+    } else if(mt||mk){
+      COLORREF fg=(ttype[k]==T_BRACKET)?(g_dark?RB_DARK[tcol[k]]:RB_LIGHT[tcol[k]]):pal[ttype[k]];
+      SetTextColor(hdc,fg); SetBkColor(hdc,bk);
+      RECT lc={leftBar()+g_gutterW,y,clipR,y+g_lineH};
+      ExtTextOut(hdc,x,y,ETO_CLIPPED,&lc,g_text.c_str()+base+k,segLen,NULL);
+    }
+    x+=runW; k=j;
+  }
+}
+
+bool lineNeedsOverlay(int base, int len){
+  if(g_selStart>=0 && base<g_selEnd && base+len>g_selStart) return true;
+  if(g_matchA>=0 && base<g_matchA+g_matchAw && base+len>g_matchA) return true;
+  if(g_matchB>=0 && base<g_matchB+g_matchBw && base+len>g_matchB) return true;
+  if(!g_markFlag.empty()){
+    int e=base+len; if(e>(int)g_markFlag.size()) e=(int)g_markFlag.size();
+    for(int c=base;c<e;c++) if(g_markFlag[c]) return true;
+  }
+  return false;
+}
+
+LineBmp& getLineBmp(int v){
+  auto it=g_lineBmp.find(v);
+  if(it!=g_lineBmp.end()){
+    if(it->second.ver==g_renderVer && it->second.cached) return it->second;
+    if(it->second.dc) DeleteDC(it->second.dc);
+    if(it->second.bmp) DeleteObject(it->second.bmp);
+    g_lineBmp.erase(it);
+  }
+  const Visual& vis=g_visual[v];
+  int line=vis.line, base=g_lineStart[line]+vis.col, len=vis.len;
+  int w=runPx(base,len); if(w<1)w=1;
+  LineBmp lb; lb.ver=g_renderVer; lb.cached=false; lb.w=0; lb.dc=NULL; lb.bmp=NULL;
+  if(w<=LINE_BMP_CAP){
+    if(!g_hdcScreen) g_hdcScreen=GetDC(g_hwnd);
+    lb.dc=CreateCompatibleDC(g_hdcScreen);
+    if(lb.dc){
+      lb.bmp=CreateCompatibleBitmap(g_hdcScreen,w,g_lineH);
+      if(lb.bmp){
+        HBITMAP oldBmp=(HBITMAP)SelectObject(lb.dc, lb.bmp);
+        SelectObject(lb.dc,g_hFont);
+        renderLineBase(lb.dc,v);
+        if(oldBmp) DeleteObject(oldBmp); // 释放兼容 DC 自带的 1x1 默认位图
+        lb.w=w; lb.cached=true;
+      } else {
+        DeleteDC(lb.dc); lb.dc=NULL;
+      }
+    }
+  }
+  g_lineBmp[v]=lb;
+  if((int)g_lineBmp.size()>LINE_BMP_MAX){
+    auto itb=g_lineBmp.begin();
+    if(itb->first!=v){ // 不删除刚插入的自身
+      if(itb->second.dc) DeleteDC(itb->second.dc);
+      if(itb->second.bmp) DeleteObject(itb->second.bmp);
+      g_lineBmp.erase(itb);
+    }
+  }
+  return g_lineBmp[v];
+}
+
+// ---- 增量重绘辅助：滚动像素平移 + 脏矩形，避免整屏重绘（滚动/拖选卡顿优化）----
+static HDC  g_bufDC=NULL;     // 持久离屏缓冲 DC（避免每帧分配全屏位图）
+static HBITMAP g_bufBmp=NULL; // 持久离屏缓冲位图
+static int  g_bufW=0, g_bufH=0;
+static void ensureBuf(int w,int h){
+  if(g_bufDC && w==g_bufW && h==g_bufH) return;
+  if(g_bufDC){ DeleteDC(g_bufDC); if(g_bufBmp) DeleteObject(g_bufBmp); g_bufDC=NULL; g_bufBmp=NULL; }
+  HDC scr=GetDC(g_hwnd);
+  g_bufDC=CreateCompatibleDC(scr);
+  g_bufBmp=CreateCompatibleBitmap(scr,w,h);
+  ReleaseDC(g_hwnd,scr);
+  SelectObject(g_bufDC,g_bufBmp);
+  g_bufW=w; g_bufH=h;
+}
+static bool rectsIntersect(const RECT& a,const RECT& b){
+  return a.left<b.right && a.right>b.left && a.top<b.bottom && a.bottom>b.top;
+}
+// 视觉行 v 与偏移区间 [s,s+w) 的交集（返回该行内列范围 [c0,c1)）；不相交返回 false
+static bool rowRun(int v,int s,int w,int& c0,int& c1){
+  if(s<0||w<=0) return false;
+  const Visual& vis=g_visual[v];
+  int rs=g_lineStart[vis.line]+vis.col;
+  int re=rs+vis.len;
+  int a=std::max(s,rs), b=std::min(s+w,re);
+  if(a>=b) return false;
+  c0=a-rs; c1=b-rs; return true;
+}
+// 视觉行 v 在区间 [s,s+w) 与 [ns,ns+nw) 下的高亮段是否不同（含行内区段变化）
+static bool runChanged(int v,int s,int w,int ns,int nw){
+  int a0,a1,b0,b1;
+  bool ow=rowRun(v,s,w,a0,a1);
+  bool nw2=rowRun(v,ns,nw,b0,b1);
+  if(ow!=nw2) return true;
+  if(ow && (a0!=b0||a1!=b1)) return true;
+  return false;
+}
+// 仅重绘“选中/匹配状态变化”的可见行（拖选卡顿优化核心）
+static void repaintSelDir(int oS,int oE,int nS,int nE, int oMa,int oMaW,int oMb,int oMbW, int nMa,int nMaW,int nMb,int nMbW){
+  RECT r; GetClientRect(g_hwnd,&r); int eTop=editorTop();
+  int visH=(r.bottom-eTop)/g_lineH + 1;
+  int sV=g_topLine, eV=g_topLine+visH+1; if(eV>g_visualCount)eV=g_visualCount;
+  for(int v=sV; v<eV; v++){
+    bool ch=false;
+    if(runChanged(v,oS,oE-oS,nS,nE-nS)) ch=true;
+    if(!ch && runChanged(v,oMa,oMaW,nMa,nMaW)) ch=true;
+    if(!ch && runChanged(v,oMb,oMbW,nMb,nMbW)) ch=true;
+    if(ch){
+      int y=eTop+(v-g_topLine)*g_lineH;
+      RECT lr={leftBar()+g_gutterW, y, r.right, y+g_lineH};
+      InvalidateRect(g_hwnd,&lr,TRUE);
+    }
+  }
+}
+// 垂直滚动：仅把已有像素平移 delta 行，重绘新露出条带（滚动卡顿优化核心）
+static void scrollByLines(int delta){
+  if(delta==0) return;
+  int dy=-delta*g_lineH;
+  RECT r; GetClientRect(g_hwnd,&r);
+  int eTop=editorTop();
+  RECT sr={leftBar(), eTop, r.right, r.bottom};
+  ScrollWindowEx(g_hwnd,0,dy,&sr,&sr,NULL,NULL,SW_INVALIDATE);
+  g_topLine+=delta;
+  updateScroll();
+  updateCaretPos();
+}
+// 查找条绘制（从 paint 中抽取，便于按更新矩形局部重绘）
+static void drawFindBar(HDC mem, RECT rc){
+  int by=TAB_H, bh=FIND_H;
+  RECT fbr={leftBar(),by,rc.right,by+bh};
+  COLORREF fb = g_dark?0x002B2521:0x00F3F3F3;
+  HBRUSH fbk=CreateSolidBrush(fb); FillRect(mem,&fbr,fbk); DeleteObject(fbk);
+  HPEN sp=CreatePen(PS_SOLID,1,g_dark?0x3A3A3A:0xD0D0D0); HPEN sop=(HPEN)SelectObject(mem,sp);
+  MoveToEx(mem,0,by+bh-1,NULL); LineTo(mem,rc.right,by+bh-1);
+  SelectObject(mem,sop); DeleteObject(sp);
+  int mx=leftBar()+g_gutterW+10, my=by+bh/2, rad=6;
+  HPEN ip=CreatePen(PS_SOLID,2,g_dark?0x9DA5B4:0x555555); HPEN iop=(HPEN)SelectObject(mem,ip);
+  HBRUSH ib=(HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH ibo=(HBRUSH)SelectObject(mem,ib);
+  Ellipse(mem,mx-rad,my-rad,mx+rad,my+rad);
+  MoveToEx(mem,mx+rad-2,my+rad-2,NULL); LineTo(mem,mx+rad+3,my+rad+3);
+  SelectObject(mem,iop); DeleteObject(ip); SelectObject(mem,ibo);
+  drawFindButton(mem,g_rPrev,L"上一项", g_findHover==1, g_findPress==1, g_dark);
+  drawFindButton(mem,g_rNext,L"下一项", g_findHover==2, g_findPress==2, g_dark);
+  drawFindCloseBtn(mem,g_rClose, g_findHover==3, g_findPress==3, g_dark);
+}
+
 void paint(){
   PAINTSTRUCT ps; HDC hdc=BeginPaint(g_hwnd,&ps);
   RECT rc; GetClientRect(g_hwnd,&rc);
+  if(rc.right<=0||rc.bottom<=0){ EndPaint(g_hwnd,&ps); return; }
   int eTop=editorTop(); // 编辑区从标签栏（及可能的查找条）下方开始
-  HDC mem=CreateCompatibleDC(hdc);
-  HBITMAP bmp=CreateCompatibleBitmap(hdc,rc.right,rc.bottom);
-  HBITMAP old=(HBITMAP)SelectObject(mem,bmp);
-  HGDIOBJ oldFnt=SelectObject(mem,g_hFont);
+  RECT ur=ps.rcPaint;   // 仅本次需要重绘的更新矩形
+  ensureBuf(rc.right, rc.bottom);
+  HDC mem=g_bufDC;
+  HGDIOBJ oldFnt=SelectObject(mem,g_hFont); // 注意：此处返回的“旧对象”实为 g_bufBmp，收尾时归还
   SetBkMode(mem,OPAQUE);
 
-  COLORREF* pal = g_dark?C_DARK:C_LIGHT; // 选取对应主题调色板
   COLORREF bg=bgColor();
   COLORREF gb=gutterBg();
 
-  // 整体背景
-  HBRUSH bgBr=CreateSolidBrush(bg);
-  FillRect(mem,&rc,bgBr); DeleteObject(bgBr);
+  // 编辑器文本带：仅重绘与更新矩形相交的部分（滚动/拖选只触及少量行）
+  int y0=std::max((int)ur.top, eTop), y1=std::min((int)ur.bottom, (int)rc.bottom);
+  if(y1>y0){
+    RECT bgr={0,y0,rc.right,y1};
+    HBRUSH bgBr=CreateSolidBrush(bg); FillRect(mem,&bgr,bgBr); DeleteObject(bgBr);
 
-  // 行号区背景
-  RECT grc={leftBar(),eTop,leftBar()+g_gutterW,rc.bottom};
-  HBRUSH gbBr=CreateSolidBrush(gb);
-  FillRect(mem,&grc,gbBr); DeleteObject(gbBr);
-  // 行号区/文本区分隔竖线
-  HPEN pen=CreatePen(PS_SOLID,1,g_dark?0x333333:0xE1E4E8);
-  HPEN op=(HPEN)SelectObject(mem,pen);
-  MoveToEx(mem,leftBar()+g_gutterW,eTop,NULL); LineTo(mem,leftBar()+g_gutterW,rc.bottom);
-  SelectObject(mem,op); DeleteObject(pen);
-
-  int edH=rc.bottom-eTop; if(edH<0)edH=0;
-  int visH=edH/g_lineH + 1; // 可见视觉行数（+1 容差，避免边界闪烁）
-  int startV=g_topLine; if(startV<0)startV=0;
-
-  // 行号（右对齐在行号区内）
-  SetTextColor(mem,gutterFg());
-  SetBkColor(mem,gb);
-  wchar_t num[16];
-  for(int v=startV; v<g_visualCount && v<startV+visH+2; v++){
-    int y=eTop+(v-startV)*g_lineH;
-    int lineNo=v+1;
-    _snwprintf(num,15,L"%d",lineNo);
-    int tw=(int)wcslen(num)*g_charW;
-    RECT nr={leftBar()+g_gutterW-6-tw,y,leftBar()+g_gutterW-6,y+g_lineH};
-    ExtTextOut(mem,leftBar()+g_gutterW-6-tw,y,ETO_CLIPPED|ETO_OPAQUE,&nr,num,(UINT)wcslen(num),NULL);
-  }
-
-  // 文本
-  for(int v=startV; v<g_visualCount && v<startV+visH+2; v++){
-    int y=eTop+(v-startV)*g_lineH;
-    const Visual& vis=g_visual[v];
-    int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
-    // 取本行的着色 token；纯文本则无 token
-    const std::vector<Token>& toks = (g_langId==L_TXT)? std::vector<Token>() : lineTokens(line);
-    // 把 token 映射到一个“视觉段内逐字符”的颜色数组 ttype/col
-    std::vector<unsigned char> ttype(len, T_TEXT);
-    std::vector<unsigned char> tcol(len,0);
-    if(g_langId!=L_TXT){
-      // t.start 是行内列号（相对行首），映射到本视觉段(vis.col 起)的颜色数组下标
-      // 用与 [vis.col, vis.col+len) 的重叠区间填充，正确处理换行跨段与边界
-      for(const Token& t: toks){
-        int c0=t.start, c1=t.start+t.len;
-        int lo=std::max(c0,vis.col), hi=std::min(c1,vis.col+len);
-        for(int c=lo;c<hi;c++){
-          ttype[c-vis.col]=t.type; tcol[c-vis.col]=t.col;
-        }
-      }
-    } else {
-      // 纯文本模式：仍对括号做彩虹着色
-      int depth=g_lineDepth[line];
-      for(int k=0;k<len;k++){
-        wchar_t c=g_text[base+k];
-        if(c==L'('||c==L'['||c==L'{'){ ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(depth%6); depth++; }
-        else if(c==L')'||c==L']'||c==L'}'){ int d=depth>0?depth-1:0; ttype[k]=T_BRACKET; tcol[k]=(unsigned char)(d%6); if(depth>0)depth--; }
-      }
+    int startV=(y0-eTop)/g_lineH + g_topLine;
+    int endV  =(y1-eTop-1)/g_lineH + g_topLine;
+    if(startV<g_topLine) startV=g_topLine;
+    if(endV>=g_visualCount) endV=g_visualCount-1;
+    for(int v=startV; v<=endV; v++){
+      int y=eTop+(v-g_topLine)*g_lineH;
+      const Visual& vis=g_visual[v];
+      int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
+      int x = (g_wrap)? (leftBar()+g_gutterW) : (leftBar()+g_gutterW - g_scrollX + linePrefixPx(line, vis.col));
+      LineBmp& lb=getLineBmp(v);
+      if(lb.cached) BitBlt(mem, x, y, lb.w, g_lineH, lb.dc, 0, 0, SRCCOPY);
+      else drawLineDirect(mem, v, x, y, rc.right); // 超长行回退到原始逐段绘制
+      if(lineNeedsOverlay(base,len)) drawLineOverlay(mem, v, x, y, rc.right);
     }
-    int x = (g_wrap)? (leftBar()+g_gutterW) : (leftBar()+g_gutterW - g_scrollX + linePrefixPx(line, vis.col));
-    // 文本裁剪限制在整个可视行区域，不再用段宽矩形（段宽取整会裁掉末尾 1~2 字符）
-    RECT lineClip={leftBar()+g_gutterW, y, rc.right, y+g_lineH};
-    int k=0;
-    // 把连续同色、同选中/配对状态的字符合并成一段绘制（减少 GDI 调用）
-    while(k<len){
-      unsigned char ty=ttype[k]; unsigned char tc=tcol[k];
-      bool sel = (g_selStart>=0 && ((base+k)>=g_selStart && (base+k)<g_selEnd));
-      bool mt  = ((g_matchA>=0 && (base+k)>=g_matchA && (base+k)<g_matchA+g_matchAw) ||
-                  (g_matchB>=0 && (base+k)>=g_matchB && (base+k)<g_matchB+g_matchBw));
-      bool mk  = (base+k < (int)g_markFlag.size()) ? (g_markFlag[base+k]!=0) : false; // 分词高亮命中
-      int j=k+1;
-      while(j<len){
-        bool sel2=(g_selStart>=0 && ((base+j)>=g_selStart && (base+j)<g_selEnd));
-        bool mt2=((g_matchA>=0 && (base+j)>=g_matchA && (base+j)<g_matchA+g_matchAw) ||
-                  (g_matchB>=0 && (base+j)>=g_matchB && (base+j)<g_matchB+g_matchBw));
-        bool mk2=(base+j < (int)g_markFlag.size()) ? (g_markFlag[base+j]!=0) : false;
-        if(sel2!=sel || mt2!=mt || mk2!=mk || ttype[j]!=ty || tcol[j]!=tc) break;
-        j++;
-      }
-      int segLen=j-k;
-      COLORREF fg = (ty==T_BRACKET)? (g_dark?RB_DARK[tc]:RB_LIGHT[tc]) : pal[ty]; // 括号用彩虹色
-      COLORREF bk = bg;
-      if(mt) bk=matchBg();
-      else if(sel) bk=selBg();
-      else if(mk) bk=markBg();
-      // 选中/配对：用真实字符像素宽填背景
-      int runW = runPx(base+k, segLen);
-      if(sel||mt){
-        RECT segR={x-1, y, x+runW+1, y+g_lineH};
-        HBRUSH hb=CreateSolidBrush(bk);
-        FillRect(mem,&segR,hb); DeleteObject(hb);
-      }
-      SetTextColor(mem, sel? (g_dark?0xFFFFFF:0x000000) : fg);
-      SetBkColor(mem,bk);
-      ExtTextOut(mem,x,y,ETO_CLIPPED,&lineClip, g_text.c_str()+base+k, segLen, NULL);
-      x+=runW;
-      k=j;
+    // 行号区（覆盖在文本之上，遮挡横向滚动溢出的文本）
+    RECT grc={leftBar(), y0, leftBar()+g_gutterW, y1};
+    HBRUSH gbBr=CreateSolidBrush(gb); FillRect(mem,&grc,gbBr); DeleteObject(gbBr);
+    HPEN pen=CreatePen(PS_SOLID,1,g_dark?0x333333:0xE1E4E8);
+    HPEN op=(HPEN)SelectObject(mem,pen);
+    MoveToEx(mem,leftBar()+g_gutterW,y0,NULL); LineTo(mem,leftBar()+g_gutterW,y1);
+    SelectObject(mem,op); DeleteObject(pen);
+    SetTextColor(mem,gutterFg()); SetBkColor(mem,gb);
+    wchar_t num[16];
+    for(int v=startV; v<=endV; v++){
+      int y=eTop+(v-g_topLine)*g_lineH;
+      int lineNo=v+1;
+      _snwprintf(num,15,L"%d",lineNo);
+      int tw=(int)wcslen(num)*g_charW;
+      RECT nr={leftBar()+g_gutterW-6-tw,y,leftBar()+g_gutterW-6,y+g_lineH};
+      ExtTextOut(mem,leftBar()+g_gutterW-6-tw,y,ETO_CLIPPED|ETO_OPAQUE,&nr,num,(UINT)wcslen(num),NULL);
     }
   }
 
-  // 查找条（显示时画在标签栏下方的工具条区域，承载输入框背景与自绘按钮）
+  // 查找条（仅当更新矩形与之相交时重绘）
   if(g_hFind){
-    int by=TAB_H, bh=FIND_H;
-    RECT fbr={leftBar(),by,rc.right,by+bh};
-    COLORREF fb = g_dark?0x002B2521:0x00F3F3F3;        // 工具条背景
-    HBRUSH fbk=CreateSolidBrush(fb); FillRect(mem,&fbr,fbk); DeleteObject(fbk);
-    HPEN sp=CreatePen(PS_SOLID,1,g_dark?0x3A3A3A:0xD0D0D0); HPEN sop=(HPEN)SelectObject(mem,sp);
-    MoveToEx(mem,0,by+bh-1,NULL); LineTo(mem,rc.right,by+bh-1); // 底部分隔线
-    SelectObject(mem,sop); DeleteObject(sp);
-    // 放大镜图标（圆 + 手柄）
-    int mx=leftBar()+g_gutterW+10, my=by+bh/2, rad=6;
-    HPEN ip=CreatePen(PS_SOLID,2,g_dark?0x9DA5B4:0x555555); HPEN iop=(HPEN)SelectObject(mem,ip);
-    HBRUSH ib=(HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH ibo=(HBRUSH)SelectObject(mem,ib);
-    Ellipse(mem,mx-rad,my-rad,mx+rad,my+rad);
-    MoveToEx(mem,mx+rad-2,my+rad-2,NULL); LineTo(mem,mx+rad+3,my+rad+3);
-    SelectObject(mem,iop); DeleteObject(ip); SelectObject(mem,ibo);
-    // 三个自绘按钮
-    drawFindButton(mem,g_rPrev,L"上一项", g_findHover==1, g_findPress==1, g_dark);
-    drawFindButton(mem,g_rNext,L"下一项", g_findHover==2, g_findPress==2, g_dark);
-    drawFindCloseBtn(mem,g_rClose, g_findHover==3, g_findPress==3, g_dark);
+    RECT fbrc={leftBar(),TAB_H,rc.right,TAB_H+FIND_H};
+    if(rectsIntersect(ur,fbrc)) drawFindBar(mem,fbrc);
+  }
+  // 标签栏（仅当更新矩形与之相交时重绘）
+  { RECT tbrc={0,0,rc.right,TAB_H}; if(rectsIntersect(ur,tbrc)) drawTabBar(mem,tbrc); }
+  // 左侧文件夹浏览器（仅当更新矩形与之相交时重绘）
+  if(g_folderOpen){
+    RECT sbrc={0,eTop,leftBar(),rc.bottom};
+    if(rectsIntersect(ur,sbrc)) drawSidebar(mem,rc);
   }
 
-  // 标签栏（覆盖最上方）
-  RECT tbrc={0,0,rc.right,TAB_H};
-  drawTabBar(mem,tbrc);
-
-  // 左侧文件夹浏览器（覆盖在行号区左侧，与编辑器互不重叠）
-  if(g_folderOpen) drawSidebar(mem,rc);
-
-  // 把内存 DC 内容一次性拷贝到屏幕
+  // 仅把更新矩形区域从内存 DC 拷到屏幕（不再整屏 BitBlt）
   SelectObject(mem,oldFnt);
-  BitBlt(hdc,0,0,rc.right,rc.bottom,mem,0,0,SRCCOPY);
-  SelectObject(mem,old);
-  DeleteObject(bmp);
-  DeleteDC(mem);
+  if(ur.right>ur.left && ur.bottom>ur.top)
+    BitBlt(hdc, ur.left, ur.top, ur.right-ur.left, ur.bottom-ur.top, mem, ur.left, ur.top, SRCCOPY);
   EndPaint(g_hwnd,&ps);
 }
 
@@ -1449,6 +1835,7 @@ void loadFile(const std::wstring& path){
   DWORD rd=0; ReadFile(h,buf.data(),sz,&rd,NULL); CloseHandle(h);
   g_filePath=path;
   g_text=decodeBytes(buf);
+  g_undoStack.clear(); g_redoStack.clear(); // 载入新文件：撤销/重做历史作废
   g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear(); // 文本变化，清除分词高亮
   g_langId=langFromName();
   rebuildLines();
@@ -1471,18 +1858,57 @@ void setWindowTitle(){
   SetWindowText(g_hwnd,(name+L" - LiteReader  ·"+lang+(dirty?L"  *":L"")).c_str());
 }
 
-// 轻量编辑：在光标处插入文本（若存在选区则先替换选区）。插入后重置选区、重切行、重绘、置脏标记。
-void insertText(const std::wstring& s){
-  int start=g_caretOff, end=g_caretOff;
-  if(g_selStart>=0){ start=g_selStart; end=g_selEnd; }
-  g_text.replace(start, end-start, s);
-  g_caretOff=start+(int)s.size();
+// 统一的文本替换入口：把 [start,end) 替换为 ins，并（可选）记录到撤销栈。
+void applyEdit(int start, int end, const std::wstring& ins, bool record){
+  if(start<0)start=0; if(end>(int)g_text.size())end=(int)g_text.size();
+  if(start>end)std::swap(start,end);
+  if(record){
+    EditStep s; s.start=start; s.del=g_text.substr(start,end-start); s.ins=ins;
+    g_undoStack.push_back(s);
+    g_redoStack.clear(); // 任何新编辑都会使“重做”历史失效
+  }
+  g_text.replace(start, end-start, ins);
+  g_caretOff=start+(int)ins.size();
   g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
   g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear(); // 文本变化，清除分词高亮
   g_matchA=-1; g_matchB=-1;
   rebuildLines(); buildVisual(); updateScroll();
   if(g_active>=0 && g_active<(int)g_docs.size()) g_docs[g_active].dirty=true;
   g_dirty=true; updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE); setWindowTitle();
+}
+// 撤销：取最近一次编辑，删除其插入串、填回删除串，并压入重做栈。
+void undo(){
+  if(g_undoStack.empty()) return;
+  EditStep s=g_undoStack.back(); g_undoStack.pop_back();
+  g_text.replace(s.start, s.ins.size(), s.del);
+  g_redoStack.push_back(s);
+  g_caretOff=s.start+(int)s.del.size();
+  g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
+  g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear();
+  g_matchA=-1; g_matchB=-1;
+  rebuildLines(); buildVisual(); updateScroll();
+  if(g_active>=0 && g_active<(int)g_docs.size()) g_docs[g_active].dirty=true;
+  g_dirty=true; updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE); setWindowTitle();
+}
+// 重做：取最近一次撤销，重新应用其插入串，并压回撤销栈。
+void redo(){
+  if(g_redoStack.empty()) return;
+  EditStep s=g_redoStack.back(); g_redoStack.pop_back();
+  g_text.replace(s.start, s.del.size(), s.ins);
+  g_undoStack.push_back(s);
+  g_caretOff=s.start+(int)s.ins.size();
+  g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
+  g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear();
+  g_matchA=-1; g_matchB=-1;
+  rebuildLines(); buildVisual(); updateScroll();
+  if(g_active>=0 && g_active<(int)g_docs.size()) g_docs[g_active].dirty=true;
+  g_dirty=true; updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE); setWindowTitle();
+}
+// 轻量编辑：在光标处插入文本（若存在选区则先替换选区）。插入后重置选区、重切行、重绘、置脏标记。
+void insertText(const std::wstring& s){
+  int start=g_caretOff, end=g_caretOff;
+  if(g_selStart>=0){ start=g_selStart; end=g_selEnd; }
+  applyEdit(start, end, s, true);
 }
 // 轻量编辑：删除字符。forward=true 删除光标后（Delete 键），false 删除光标前（Backspace 键）；有选区则删除选区。
 void deleteChar(bool forward){
@@ -1491,14 +1917,7 @@ void deleteChar(bool forward){
   else if(forward){ if(g_caretOff<(int)g_text.size()) end=g_caretOff+1; else return; }
   else { if(g_caretOff>0) start=g_caretOff-1; else return; }
   if(start>=end) return;
-  g_text.erase(start, end-start);
-  g_caretOff=start;
-  g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
-  g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear();
-  g_matchA=-1; g_matchB=-1;
-  rebuildLines(); buildVisual(); updateScroll();
-  if(g_active>=0 && g_active<(int)g_docs.size()) g_docs[g_active].dirty=true;
-  g_dirty=true; updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE); setWindowTitle();
+  applyEdit(start, end, L"", true);
 }
 // 另存为对话框（保存时用）
 std::wstring saveFileDialog(){
@@ -1631,6 +2050,7 @@ void openInNewTab(const std::wstring& path){
   g_active=(int)g_docs.size()-1;
   loadFile(path);
   g_docs[g_active].filePath=g_filePath;
+  ensureActiveTabVisible(); // 新标签滚入可视区
   InvalidateRect(g_hwnd,NULL,TRUE);
 }
 
@@ -1643,6 +2063,7 @@ void switchTab(int j){
   g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear(); // 切换标签，清除上一个文档的分词高亮
   buildVisual();
   updateScroll();
+  ensureActiveTabVisible(); // 切换后当前标签滚入可视区
   InvalidateRect(g_hwnd,NULL,TRUE);
   updateCaretPos();
   setWindowTitle();
@@ -1661,6 +2082,7 @@ void closeTab(int i){
     g_caretOff=0; g_anchorOff=0; g_selStart=-1; g_selEnd=-1; g_matchA=-1; g_matchB=-1; g_matchAw=1; g_matchBw=1;
     g_topLine=0; g_scrollX=0; g_visual.clear(); g_visualCount=0;
     g_docs[0]=Doc();
+    g_undoStack.clear(); g_redoStack.clear(); // 内容清空：撤销/重做历史作废
     rebuildLines(); buildVisual(); updateScroll(); InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
     return;
   }
@@ -1669,11 +2091,12 @@ void closeTab(int i){
     g_docs.erase(g_docs.begin()+i);
     g_active = neighbor; if(g_active>=(int)g_docs.size()) g_active=(int)g_docs.size()-1; if(g_active<0) g_active=0;
     restoreFrom(g_active);
-    buildVisual(); updateScroll(); InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
+    buildVisual(); updateScroll(); ensureActiveTabVisible(); InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
   } else {
     g_docs.erase(g_docs.begin()+i);
     if(i<g_active) g_active--; // 删除的是当前标签之前的，索引需前移
   }
+  ensureActiveTabVisible();
   InvalidateRect(g_hwnd,NULL,TRUE);
 }
 
@@ -1739,6 +2162,126 @@ void checkMenu(HMENU hMenu){
 }
 
 // ----------------------------------------------------------------------------
+// 右键菜单与标签批量关闭
+// ----------------------------------------------------------------------------
+// 复制当前选区到剪贴板（无选区则无操作）
+void copySelection(){
+  if(g_selStart<0) return;
+  std::wstring sub=g_text.substr(g_selStart,g_selEnd-g_selStart);
+  HGLOBAL hg=GlobalAlloc(GMEM_MOVEABLE,(sub.size()+1)*sizeof(wchar_t));
+  if(!hg) return;
+  wchar_t* p=(wchar_t*)GlobalLock(hg); wcscpy_s(p,sub.size()+1,sub.c_str()); GlobalUnlock(hg);
+  OpenClipboard(g_hwnd); EmptyClipboard(); SetClipboardData(CF_UNICODETEXT,hg); CloseClipboard();
+}
+// 剪切：复制后删除选区（复用 insertText 空串，自动记录撤销）
+void cutSelection(){
+  if(g_selStart<0) return;
+  copySelection();
+  insertText(L"");
+}
+// 粘贴：读取剪贴板文本并插入（替换选区，自动记录撤销）
+void pasteFromClipboard(){
+  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
+  if(!OpenClipboard(g_hwnd)) return;
+  HANDLE h=GetClipboardData(CF_UNICODETEXT);
+  if(h){
+    wchar_t* p=(wchar_t*)GlobalLock(h);
+    if(p){ insertText(std::wstring(p)); GlobalUnlock(h); }
+  }
+  CloseClipboard();
+}
+// 全选
+void selectAll(){
+  g_selStart=0; g_selEnd=(int)g_text.size(); g_anchorOff=0; g_caretOff=(int)g_text.size();
+  InvalidateRect(g_hwnd,NULL,TRUE);
+}
+// 编辑区右键：在点击处放置光标；若已有选区且点击落在选区内则保留选区（方便复制）
+void placeCaretForContext(int x,int y){
+  int ey=y-editorTop();
+  int v=ey/g_lineH + g_topLine;
+  if(v<0||v>=g_visualCount) return;
+  const Visual& vis=g_visual[v];
+  int target=(g_wrap? linePrefixPx(vis.line,vis.col):0)+(x-leftBar()-g_gutterW)+(g_wrap?0:g_scrollX);
+  int col=pxToColAbs(vis.line,target);
+  if(col<vis.col)col=vis.col; if(col>vis.col+vis.len)col=vis.col+vis.len;
+  if(col<0)col=0; if(col>g_lineLen[vis.line])col=g_lineLen[vis.line];
+  int off=g_lineStart[vis.line]+col;
+  if(g_selStart>=0 && off>=g_selStart && off<g_selEnd) return; // 落在原选区内：保留选区
+  g_anchorOff=off; g_caretOff=off; g_selStart=-1; g_selEnd=-1;
+  findMatch(); updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE);
+}
+// 由 x 坐标反推标签索引（与 drawTabBar 布局一致）
+int tabIndexAt(int x){
+  RECT rc; GetClientRect(g_hwnd,&rc);
+  int x0=TAB_X0 - g_tabScroll;
+  for(int i=0;i<(int)g_docs.size();i++){
+    int w=tabWidthFor(i);
+    if(x>=x0 && x<x0+w) return i;
+    x0+=w;
+  }
+  return -1;
+}
+// 批量关闭：仅保留 keep 一个标签
+void closeOtherTabs(int keep){
+  int n=(int)g_docs.size(); if(n<=1||keep<0||keep>=n) return;
+  if(g_active!=keep){ g_active=keep; restoreFrom(g_active); }
+  Doc keepDoc=std::move(g_docs[keep]);
+  g_docs.clear(); g_docs.push_back(std::move(keepDoc));
+  g_active=0;
+  g_topLine=0; g_scrollX=0; invalidateLineCache();
+  ensureActiveTabVisible(); buildVisual(); updateScroll();
+  InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
+}
+// 批量关闭：保留 idx 及其右侧
+void closeLeftTabs(int idx){
+  int n=(int)g_docs.size(); if(idx<=0||idx>=n) return;
+  if(g_active!=idx){ g_active=idx; restoreFrom(g_active); }
+  std::vector<Doc> kept;
+  for(int i=idx;i<n;i++) kept.push_back(std::move(g_docs[i]));
+  g_docs.swap(kept);
+  g_active=0;
+  g_topLine=0; g_scrollX=0; invalidateLineCache();
+  ensureActiveTabVisible(); buildVisual(); updateScroll();
+  InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
+}
+// 批量关闭：保留 idx 及其左侧
+void closeRightTabs(int idx){
+  int n=(int)g_docs.size(); if(idx<0||idx>=n-1) return;
+  if(g_active>idx){ g_active=idx; restoreFrom(g_active); }
+  g_docs.erase(g_docs.begin()+idx+1, g_docs.end());
+  if(g_active>idx) g_active=idx;
+  g_topLine=0; g_scrollX=0; invalidateLineCache();
+  ensureActiveTabVisible(); buildVisual(); updateScroll();
+  InvalidateRect(g_hwnd,NULL,TRUE); updateCaretPos(); setWindowTitle();
+}
+// 弹出标签右键菜单（关闭左侧/右侧/全部关闭保留选中）
+void showTabMenu(HWND hwnd,int sx,int sy,int idx){
+  HMENU m=CreatePopupMenu();
+  AppendMenu(m,MF_STRING,1501,L"关闭左侧");
+  AppendMenu(m,MF_STRING,1502,L"关闭右侧");
+  AppendMenu(m,MF_STRING,1503,L"全部关闭保留选中");
+  if(idx==0) EnableMenuItem(m,1501,MF_GRAYED);
+  if(idx==(int)g_docs.size()-1) EnableMenuItem(m,1502,MF_GRAYED);
+  if(g_docs.size()<=1) EnableMenuItem(m,1503,MF_GRAYED);
+  g_ctxTab=idx;
+  TrackPopupMenu(m,TPM_RIGHTBUTTON,sx,sy,0,hwnd,NULL);
+  DestroyMenu(m);
+}
+// 弹出编辑区右键菜单（复制/剪切/粘贴/全选）
+void showEditorMenu(HWND hwnd,int sx,int sy){
+  HMENU m=CreatePopupMenu();
+  AppendMenu(m,MF_STRING,1401,L"复制\tCtrl+C");
+  AppendMenu(m,MF_STRING,1402,L"剪切\tCtrl+X");
+  AppendMenu(m,MF_STRING,1403,L"粘贴\tCtrl+V");
+  AppendMenu(m,MF_SEPARATOR,0,NULL);
+  AppendMenu(m,MF_STRING,1404,L"全选\tCtrl+A");
+  if(!(g_selStart>=0)){ EnableMenuItem(m,1401,MF_GRAYED); EnableMenuItem(m,1402,MF_GRAYED); }
+  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) EnableMenuItem(m,1403,MF_GRAYED);
+  TrackPopupMenu(m,TPM_RIGHTBUTTON,sx,sy,0,hwnd,NULL);
+  DestroyMenu(m);
+}
+
+// ----------------------------------------------------------------------------
 // 主窗口过程
 // 处理所有窗口消息：创建、绘制、滚动、鼠标、键盘、菜单、命令、销毁等。
 // ----------------------------------------------------------------------------
@@ -1761,9 +2304,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_SIZE:{
       ensureFont();
-      buildVisual();
+      if(g_wrap){ buildVisual(); invalidateLineCache(); } // 换行模式视觉行随宽度变化需重建+失效缓存；非换行视觉行与宽度无关
       updateScroll();
       clampTreeScroll();        // 窗口尺寸变化后，侧栏树滚动范围需重新夹紧
+      { RECT r; GetClientRect(hwnd,&r);   // 侧栏宽度不能超过窗口，且夹在最小/最大之间
+        int maxW=r.right-60; if(g_sidebarW>maxW)g_sidebarW=maxW; if(g_sidebarW<SIDEBAR_W_MIN)g_sidebarW=SIDEBAR_W_MIN; }
+      clampTabScroll();         // 窗口变宽后把标签滚回可视区
       InvalidateRect(hwnd,NULL,TRUE);
       if(g_hFind) toggleFind(); // 窗口尺寸变化会导致子控件错位，先收起查找条
       return 0;
@@ -1776,7 +2322,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else if(m==SB_PAGEUP) pos-=page; else if(m==SB_PAGEDOWN) pos+=page;
       else if(m==SB_THUMBTRACK) pos=HIWORD(wp); else if(m==SB_THUMBPOSITION) pos=HIWORD(wp);
       if(pos<0)pos=0; if(pos>g_visualCount-1)pos=g_visualCount-1;
-      g_topLine=pos; SetScrollPos(hwnd,SB_VERT,pos,TRUE); InvalidateRect(hwnd,NULL,TRUE);
+      if(pos!=g_topLine) scrollByLines(pos-g_topLine); // 仅平移像素 + 重绘露出条带
+      SetScrollPos(hwnd,SB_VERT,pos,TRUE);
       return 0;
     }
     case WM_HSCROLL:{
@@ -1786,15 +2333,48 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else if(m==SB_PAGELEFT)pos-=80; else if(m==SB_PAGERIGHT)pos+=80;
       else if(m==SB_THUMBTRACK)pos=HIWORD(wp); else if(m==SB_THUMBPOSITION)pos=HIWORD(wp);
       if(pos<0)pos=0;
-      int maxX=0; for(int l=0;l<g_lineCount;l++){int w=linePx(l); if(w>maxX)maxX=w;}
+      int maxX=g_maxLineW; // 缓存最大行宽，避免每行 linePx 全量扫描
       RECT r; GetClientRect(hwnd,&r); int hmax=maxX-(r.right-r.left-leftBar()-g_gutterW); if(hmax<0)hmax=0;
       if(pos>hmax)pos=hmax;
       g_scrollX=pos; SetScrollPos(hwnd,SB_HORZ,pos,TRUE); InvalidateRect(hwnd,NULL,TRUE);
       return 0;
     }
+    case WM_CONTEXTMENU:{
+      int sx=(int)(short)LOWORD(lp), sy=(int)(short)HIWORD(lp); // 屏幕坐标
+      POINT pt={sx,sy}; ScreenToClient(hwnd,&pt);
+      int x=pt.x, y=pt.y;
+      // 标签栏区域：按右击位置定位标签，弹出标签菜单
+      if(y<TAB_H){
+        int idx=tabIndexAt(x);
+        if(idx>=0) showTabMenu(hwnd,sx,sy,idx);
+        return 0;
+      }
+      // 编辑区（含行号区/查找条下方，且不在侧栏内）：弹出编辑菜单，并在点击处放置光标
+      if(y>=editorTop() && x>=leftBar()){
+        placeCaretForContext(x,y);
+        showEditorMenu(hwnd,sx,sy);
+        return 0;
+      }
+      return 0; // 侧栏等其它区域不弹出菜单
+    }
     case WM_MOUSEWHEEL:{
       int sx=(int)(short)LOWORD(lp), sy=(int)(short)HIWORD(lp);
       POINT pt={sx,sy}; ScreenToClient(hwnd,&pt);
+      // Ctrl+滚轮：调整字号（每格 ±1pt，范围 9~28）
+      if(GetKeyState(VK_CONTROL)&0x8000){
+        int d=GET_WHEEL_DELTA_WPARAM(wp);
+        g_fontSize += (d>0)?1:-1;
+        if(g_fontSize<9)g_fontSize=9; if(g_fontSize>28)g_fontSize=28;
+        ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos();
+        return 0;
+      }
+      // 光标在标签栏上：水平滚动标签条
+      if(pt.y<TAB_H){
+        int d=GET_WHEEL_DELTA_WPARAM(wp);
+        g_tabScroll += (d>0? 1 : -1) * 60;
+        clampTabScroll();
+        InvalidateRect(hwnd,NULL,TRUE); return 0;
+      }
       // 光标在侧栏内：滚动文件夹树
       if(g_folderOpen && pt.x<leftBar() && pt.y>=editorTop()){
         int delta=GET_WHEEL_DELTA_WPARAM(wp);
@@ -1806,7 +2386,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       int lines=(delta/WHEEL_DELTA)*(-3); // 每格滚轮滚动 3 行（方向取反）
       int pos=g_topLine+lines;
       if(pos<0)pos=0; if(pos>g_visualCount-1)pos=g_visualCount-1;
-      g_topLine=pos; SetScrollPos(hwnd,SB_VERT,pos,TRUE); InvalidateRect(hwnd,NULL,TRUE);
+      if(pos!=g_topLine) scrollByLines(pos-g_topLine);
+      SetScrollPos(hwnd,SB_VERT,pos,TRUE);
       return 0;
     }
     case WM_COPYDATA:{
@@ -1826,22 +2407,37 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_KILLFOCUS: DestroyCaret(); return 0;
     case WM_LBUTTONDOWN:{
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
-      // 标签栏区域：判断点中“新建”按钮、关闭按钮还是切换标签
+      // 标签栏区域：判断点中“新建”按钮、关闭按钮还是切换标签（标签宽度按名称动态计算）
       if(y<TAB_H){
-        int n=(int)g_docs.size();
-        int px=TAB_X0 + n*TAB_W;
-        RECT pr={px+2,2,px+2+PLUS_W,TAB_H-2};
+        RECT rc; GetClientRect(hwnd,&rc);
+        int plusX=rc.right-PLUS_W;
         POINT pt={x,y};
+        // “新建标签”按钮（+）钉在最右侧，始终可见
+        RECT pr={plusX+2,2,plusX+PLUS_W-2,TAB_H-2};
         if(PtInRect(&pr,pt)){ std::wstring p=openFileDialog(); if(!p.empty()) openInNewTab(p); return 0; }
+        int stripRight=rc.right-PLUS_W;
+        int cx=TAB_X0-g_tabScroll;
+        int n=(int)g_docs.size();
         for(int i=0;i<n;i++){
-          int tx=TAB_X0 + i*TAB_W;
-          if(x>=tx && x<tx+TAB_W){
-            RECT cr={tx+TAB_W-18,4,tx+TAB_W-4,TAB_H-4};
+          int w=tabWidthFor(i);
+          if(cx+w<=0){ cx+=w; continue; }   // 完全在可视区左侧外
+          if(cx>=stripRight) break;          // 已超出条带右界
+          if(x>=cx && x<cx+w){
+            RECT cr={cx+w-TAB_CLOSE_W,4,cx+w-4,TAB_H-4};
             if(PtInRect(&cr,pt)){ closeTab(i); return 0; } // 点中关闭 ×
             switchTab(i); return 0;                        // 否则切换标签
           }
+          cx+=w;
         }
         return 0;
+      }
+      // 侧栏右缘拖动调宽（命中热区 [lb-1, lb+3]，避开树滚动条与行点击）
+      if(g_folderOpen && y>=TAB_H){
+        int lb=leftBar();
+        if(x>=lb-1 && x<=lb+3){
+          g_sidebarResizing=true; g_sidebarResizeStartX=x; g_sidebarResizeStartW=g_sidebarW;
+          SetCapture(hwnd); return 0;
+        }
       }
       // 左侧文件夹树区域（在标签栏下方、查找条/编辑器左侧）
       if(g_folderOpen && x<leftBar() && y>=editorTop()){ sidebarDown(x,y); return 0; }
@@ -1875,6 +2471,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSEMOVE:{
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
+      // 正在拖动侧栏右缘调宽
+      if(g_sidebarResizing){
+        int dx=x-g_sidebarResizeStartX;
+        g_sidebarW=g_sidebarResizeStartW+dx;
+        if(g_sidebarW<SIDEBAR_W_MIN)g_sidebarW=SIDEBAR_W_MIN;
+        if(g_sidebarW>SIDEBAR_W_MAX)g_sidebarW=SIDEBAR_W_MAX;
+        RECT r; GetClientRect(hwnd,&r);
+        int maxW=r.right-60; if(g_sidebarW>maxW)g_sidebarW=maxW;
+        updateScroll();                       // 编辑区宽度变化，重算水平滚动范围
+        InvalidateRect(hwnd,NULL,TRUE);
+        return 0;
+      }
       // 正在拖动侧栏树滚动条：实时更新滚动位置
       if(g_treeDrag){
         RECT r; GetClientRect(g_hwnd,&r);
@@ -1897,6 +2505,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
         if(h!=g_findHover){ g_findHover=h; TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,g_hwnd,0}; TrackMouseEvent(&tme); RECT rc; GetClientRect(hwnd,&rc); RECT br={leftBar(),TAB_H,rc.right,TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
       }
+      // 悬停在侧栏右缘：显示左右调整光标（并跳过树行高亮）
+      if(g_folderOpen && y>=TAB_H){
+        int lb=leftBar();
+        if(x>=lb-1 && x<=lb+3){ SetCursor(LoadCursor(NULL,IDC_SIZEWE)); return 0; }
+      }
       // 侧栏悬停高亮（目录/文件行与关闭按钮）
       if(g_folderOpen && x<leftBar() && y>=editorTop()){ sidebarMove(x,y); return 0; }
       if(wp & MK_LBUTTON){
@@ -1904,7 +2517,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // 选区拖到编辑区边缘时自动水平滚动
         RECT r; GetClientRect(hwnd,&r);
         int lb=leftBar();
-        int maxX=0; for(int ll=0;ll<g_lineCount;ll++){int w=linePx(ll); if(w>maxX)maxX=w;}
+        int oldScrollX=g_scrollX; // 记录拖拽前的水平滚动量，用于判断是否需退化整屏重绘
+        int maxX=g_maxLineW; // 缓存最大行宽，避免拖拽选择时每行 linePx 全量扫描（大文件卡顿主因）
         int hmax=maxX-(r.right-r.left-lb-g_gutterW); if(hmax<0)hmax=0;
         if(hmax>0 && x>=lb+g_gutterW){
           int step=g_charW*3; bool scrolled=false;
@@ -1924,14 +2538,24 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(col<0)col=0; if(col>g_lineLen[vis.line])col=g_lineLen[vis.line];
         int off=g_lineStart[vis.line]+col;
         g_caretOff=off;
+        int oS=g_selStart, oE=g_selEnd, oMa=g_matchA, oMb=g_matchB, oMaW=g_matchAw, oMbW=g_matchBw;
         // 以 anchor 为起点、当前 off 为终点，生成选区 [selStart, selEnd)
         if(g_anchorOff<g_caretOff){ g_selStart=g_anchorOff; g_selEnd=g_caretOff; }
         else { g_selStart=g_caretOff; g_selEnd=g_anchorOff; }
-        findMatch(); updateCaretPos(); InvalidateRect(hwnd,NULL,TRUE);
+        findMatch();
+        if(g_scrollX!=oldScrollX){
+          // 水平位置变化：所有可见行 x 偏移改变，退化为整屏重绘（仅拖到左右边缘时触发）
+          InvalidateRect(hwnd,NULL,TRUE);
+        } else {
+          // 仅重绘“选中/匹配状态”发生变化的可见行（拖选卡顿优化核心）
+          repaintSelDir(oS,oE,g_selStart,g_selEnd, oMa,oMaW,oMb,oMbW, g_matchA,g_matchAw,g_matchB,g_matchBw);
+        }
+        updateCaretPos();
       }
       return 0;
     }
     case WM_LBUTTONUP:{
+      if(g_sidebarResizing){ g_sidebarResizing=false; ReleaseCapture(); return 0; }
       if(g_treeDrag){ g_treeDrag=false; ReleaseCapture(); return 0; }
       if(g_findPress){ g_findPress=0; RECT rc; GetClientRect(hwnd,&rc); RECT br={0,TAB_H,rc.right,TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
       ReleaseCapture(); return 0;
@@ -1995,6 +2619,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           return 0;
         }
         else if(wp=='A'){ g_selStart=0; g_selEnd=(int)g_text.size(); g_anchorOff=0; g_caretOff=(int)g_text.size(); InvalidateRect(hwnd,NULL,TRUE); return 0; }
+        else if(wp=='Z'){ if(shift) redo(); else undo(); return 0; } // Ctrl+Z 撤销；Ctrl+Shift+Z 重做
+        else if(wp=='Y'){ redo(); return 0; }                       // Ctrl+Y 重做
         else if(wp==VK_TAB){ int n=(int)g_docs.size(); if(n>1){ int nx= shift? (g_active-1+n)%n : (g_active+1)%n; switchTab(nx); } return 0; }
       }
       // 方向键/Home/End/PageUp/PageDown 移动光标（保持列号，遇短行则夹取）
@@ -2063,17 +2689,20 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else if(id==1003){ DestroyWindow(hwnd); }
       else if(id==1007){ std::wstring p=openFolderDialog(); if(!p.empty()) openFolder(p); }
       else if(id==1008){ closeFolder(); }
-      else if(id==1101){ // 复制
-        if(g_selStart>=0){ std::wstring sub=g_text.substr(g_selStart,g_selEnd-g_selStart);
-          HGLOBAL hg=GlobalAlloc(GMEM_MOVEABLE,(sub.size()+1)*2);
-          wchar_t* p=(wchar_t*)GlobalLock(hg); wcscpy_s(p,sub.size()+1,sub.c_str()); GlobalUnlock(hg);
-          OpenClipboard(hwnd); EmptyClipboard(); SetClipboardData(CF_UNICODETEXT,hg); CloseClipboard();
-        }
-      }
+      else if(id==1101){ copySelection(); } // 复制（主菜单“编辑”）
       else if(id==1102){ g_selStart=0; g_selEnd=(int)g_text.size(); g_anchorOff=0; g_caretOff=(int)g_text.size(); InvalidateRect(hwnd,NULL,TRUE); }
       else if(id==1103){ toggleFind(); }
-      else if(id==1201){ g_dark=!g_dark; InvalidateRect(hwnd,NULL,TRUE); } // 切换深浅主题
-      else if(id==1202){ g_wrap=!g_wrap; buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); }
+      // 编辑区右键菜单
+      else if(id==1401){ copySelection(); }
+      else if(id==1402){ cutSelection(); }
+      else if(id==1403){ pasteFromClipboard(); }
+      else if(id==1404){ selectAll(); }
+      // 标签栏右键菜单
+      else if(id==1501){ if(g_ctxTab>=0) closeLeftTabs(g_ctxTab); }
+      else if(id==1502){ if(g_ctxTab>=0) closeRightTabs(g_ctxTab); }
+      else if(id==1503){ if(g_ctxTab>=0) closeOtherTabs(g_ctxTab); }
+      else if(id==1201){ g_dark=!g_dark; invalidateLineCache(); InvalidateRect(hwnd,NULL,TRUE); } // 切换深浅主题
+      else if(id==1202){ g_wrap=!g_wrap; buildVisual(); invalidateLineCache(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); }
       else if(id==1203){ g_fontSize++; if(g_fontSize>28)g_fontSize=28; ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos(); }
       else if(id==1204){ g_fontSize--; if(g_fontSize<9)g_fontSize=9; ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos(); }
       else if(id>=1300 && id<=1313){ // 选择语言
@@ -2081,6 +2710,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_lang=langs[id-1300];
         g_langId=langFromName();
         g_tokens.assign(g_lineCount, std::vector<Token>()); g_tokDone.assign(g_lineCount,false); // 清缓存重着色
+        invalidateLineCache(); // 着色规则变化，行缓存失效
         // 同步到当前文档快照
         if(g_active>=0) g_docs[g_active].lang=g_lang, g_docs[g_active].langId=g_langId;
         InvalidateRect(hwnd,NULL,TRUE); setWindowTitle();
