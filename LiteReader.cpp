@@ -258,6 +258,8 @@ inline int min3(int a,int b,int c){ int m=a; if(b<m)m=b; if(c<m)m=c; return m; }
 
 // 前向声明：在 scanLine / paint 等函数定义之前，先把会调用到的函数声明出来
 void updateScroll();
+std::wstring selectedOrWordAtCaret();  // 取目标标识符（选区首词 / 光标整词），供跳转定义菜单使用
+void gotoDefinition(const std::wstring& name); // 在文档内按启发式跳转到标识符定义
 int leftBar();                     // 左侧栏宽度（未打开文件夹时为 0）
 void updateCaretPos();
 void setWindowTitle();
@@ -2275,10 +2277,173 @@ void showEditorMenu(HWND hwnd,int sx,int sy){
   AppendMenu(m,MF_STRING,1403,L"粘贴\tCtrl+V");
   AppendMenu(m,MF_SEPARATOR,0,NULL);
   AppendMenu(m,MF_STRING,1404,L"全选\tCtrl+A");
+  AppendMenu(m,MF_SEPARATOR,0,NULL);
+  AppendMenu(m,MF_STRING,1405,L"在命令提示符中打开");
+  AppendMenu(m,MF_SEPARATOR,0,NULL);
+  AppendMenu(m,MF_STRING,1406,L"跳转到定义\tF12");
   if(!(g_selStart>=0)){ EnableMenuItem(m,1401,MF_GRAYED); EnableMenuItem(m,1402,MF_GRAYED); }
   if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) EnableMenuItem(m,1403,MF_GRAYED);
+  if(selectedOrWordAtCaret().empty()) EnableMenuItem(m,1406,MF_GRAYED);
   TrackPopupMenu(m,TPM_RIGHTBUTTON,sx,sy,0,hwnd,NULL);
   DestroyMenu(m);
+}
+
+// 打开外部终端：优先 Windows Terminal（wt.exe），其次 PowerShell，最后 cmd。
+// 工作目录取“当前焦点标签文件所在目录”。
+static bool launchTerminal(const wchar_t* exe, const std::wstring& args, const std::wstring& dir){
+  HINSTANCE r=ShellExecuteW(NULL,L"open",exe,args.empty()?NULL:args.c_str(),dir.c_str(),SW_SHOWNORMAL);
+  return (INT_PTR)r>32; // ShellExecute 返回 >32 表示成功
+}
+// 当前焦点标签文件所在目录（无文件时回退“我的文档”）
+std::wstring currentDir(){
+  if(!g_filePath.empty()){
+    size_t pos=g_filePath.find_last_of(L"\\/");
+    return (pos!=std::wstring::npos)? g_filePath.substr(0,pos) : g_filePath;
+  }
+  wchar_t buf[MAX_PATH]={0};
+  return (SHGetFolderPathW(NULL,CSIDL_PERSONAL,NULL,0,buf)==S_OK)? std::wstring(buf) : std::wstring(L"C:\\");
+}
+void openTerminalHere(){
+  std::wstring dir=currentDir();
+  if(launchTerminal(L"wt.exe", L"-d \""+dir+L"\"", dir)) return;        // Windows Terminal：用 -d 指定起始目录
+  if(launchTerminal(L"powershell.exe", L"", dir)) return;               // PowerShell：起始目录即工作目录
+  if(launchTerminal(L"cmd.exe", L"", dir)) return;                      // 兜底 cmd
+}
+// 查找“已经打开”的终端窗口：枚举顶层窗口，匹配控制台类（cmd/PowerShell 的 conhost）或 Windows Terminal
+struct TermEnumCtx { HWND found; };
+static BOOL CALLBACK TermEnumProc(HWND hwnd, LPARAM lParam){
+  TermEnumCtx* c=(TermEnumCtx*)lParam;
+  wchar_t cls[64]={0};
+  if(GetClassNameW(hwnd,cls,64)>0){
+    if(wcscmp(cls,L"ConsoleWindowClass")==0 || wcscmp(cls,L"CASCADIA_HOSTING_WINDOW_CLASS")==0){
+      c->found=hwnd; return FALSE; // 命中即停止
+    }
+  }
+  return TRUE;
+}
+static HWND findOpenTerminal(){ TermEnumCtx c={NULL}; EnumWindows(TermEnumProc,(LPARAM)&c); return c.found; }
+// 把文本写入系统剪贴板
+static void setClipboardText(const std::wstring& s){
+  if(s.empty()) return;
+  if(!OpenClipboard(NULL)) return;
+  EmptyClipboard();
+  HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,(s.size()+1)*sizeof(wchar_t));
+  if(h){ wchar_t* p=(wchar_t*)GlobalLock(h); wcscpy_s(p,s.size()+1,s.c_str()); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
+  CloseClipboard();
+}
+// 右键菜单「在命令提示符中打开」：打开（或复用已开）终端，把选中文字粘贴到命令行但不提交（不回车）
+void openTerminalAndPasteSel(){
+  std::wstring sel;
+  if(g_selStart>=0) sel=g_text.substr(g_selStart,g_selEnd-g_selStart);
+  HWND term=findOpenTerminal();
+  if(!term){               // 没有已开的终端 → 在本文件目录新开一个
+    openTerminalHere();
+    Sleep(500);            // 等窗口真正创建出来
+    term=findOpenTerminal();
+  }
+  if(!term) return;
+  if(IsIconic(term)) ShowWindow(term,SW_RESTORE);
+  SetForegroundWindow(term);
+  if(sel.empty()) return;  // 没有选中内容则仅打开，不粘贴
+  setClipboardText(sel);   // 放到剪贴板，终端里 Ctrl+V 即粘贴（且不回车）
+  Sleep(80);               // 等窗口拿到焦点
+  INPUT inp[4]={0};
+  inp[0].type=INPUT_KEYBOARD; inp[0].ki.wVk=VK_CONTROL;
+  inp[1].type=INPUT_KEYBOARD; inp[1].ki.wVk='V';
+  inp[2].type=INPUT_KEYBOARD; inp[2].ki.wVk='V';            inp[2].ki.dwFlags=KEYEVENTF_KEYUP;
+  inp[3].type=INPUT_KEYBOARD; inp[3].ki.wVk=VK_CONTROL;     inp[3].ki.dwFlags=KEYEVENTF_KEYUP;
+  SendInput(4,inp,sizeof(INPUT));
+}
+
+// ----------------------------------------------------------------------------
+// 跳转到定义：在当前“文档内”按启发式查找标识符的“定义”位置并跳转。
+// 适用范围：单文件内的函数/变量定义跳转（不跨文件、不做语义解析，纯文本扫描）。
+// 判定规则（启发式打分，越高越像“定义”）：
+//   1) 标识符随后紧跟 '(' 视为“函数式”            +3 分；
+//   2) 前方修饰/类型关键字（public/void/int/def/class/function/const/let/var/
+//      create/procedure/table/trigger/view 等）视为“声明” +5 分；
+//   3) 前方是首字母大写的词（疑似类型名）          +2 分。
+// 取全文中得分最高、且尽量非当前行的位置跳转，并选中该词便于确认。
+// ----------------------------------------------------------------------------
+static bool iequals(const std::wstring& a, const std::wstring& b){
+  if(a.size()!=b.size()) return false;
+  for(size_t i=0;i<a.size();i++){ if(towlower(a[i])!=towlower(b[i])) return false; }
+  return true;
+}
+// 取“目标标识符”：优先用选区的首词，否则用光标下的整词
+std::wstring selectedOrWordAtCaret(){
+  if(g_selStart>=0 && g_selEnd>g_selStart){
+    std::wstring sel=g_text.substr(g_selStart,g_selEnd-g_selStart);
+    int a=0,b=(int)sel.size();
+    while(a<b && !isWordChar(sel[a])) a++;
+    while(b>a && !isWordChar(sel[b-1])) b--;
+    if(a<b) return sel.substr(a,b-a);
+    return L"";
+  }
+  int ws,we; wordAtOffset(g_caretOff,ws,we);
+  if(we>ws) return g_text.substr(ws,we-ws);
+  return L"";
+}
+// 取 off 之前的整词（不含 off 本身）
+static std::wstring prevWordAt(int off){
+  int p=off-1;
+  while(p>=0 && isWordChar(g_text[p])) p--;
+  return g_text.substr(p+1, off-(p+1));
+}
+// 取 off 之后第一个非空白字符（用于判断 name 后是否跟 '('）
+static wchar_t nextNonSpace(int off){
+  int e=off;
+  while(e<(int)g_text.size() && (g_text[e]==L' '||g_text[e]==L'\t')) e++;
+  return (e<(int)g_text.size())? g_text[e] : 0;
+}
+// 对某一行某次整词命中打分（越高越像“定义”）
+static int scoreDefinition(int line, int pos, int len){
+  int score=1;                                   // 基础分：任意整词命中
+  std::wstring prev=prevWordAt(pos);
+  wchar_t nxt=nextNonSpace(pos+len);
+  if(nxt==L'(') score+=3;                        // 后面跟 ( => 函数式定义
+  static const wchar_t* defKw[]={
+    L"def",L"class",L"function",L"func",L"public",L"private",L"protected",
+    L"static",L"void",L"int",L"long",L"short",L"char",L"float",L"double",
+    L"bool",L"boolean",L"string",L"unsigned",L"signed",L"const",L"let",L"var",
+    L"create",L"procedure",L"table",L"trigger",L"view",L"index",L"struct",
+    L"enum",L"interface",L"final",L"abstract",L"virtual",L"override",L"new",
+    L"friend",L"inline",L"operator",L"namespace",L"module",L"sub",L"proc",
+    L"fn",L"type",L"local",L"global",L"dim",L"set",L"property"
+  };
+  for(const wchar_t* k : defKw){ if(iequals(prev,k)){ score+=5; break; } }
+  if(prev.size()>=2 && iswupper((wchar_t)prev[0])!=0) score+=2; // 前方首字母大写词（疑似类型名）
+  return score;
+}
+// 跳转到 name 的“定义”：扫描全文挑选得分最高的位置并跳转
+void gotoDefinition(const std::wstring& name){
+  if(name.empty()) return;
+  int n=g_lineCount, lns=(int)name.size();
+  int bestOff=-1, bestScore=0;
+  int caretLine=lineOfOffset(g_caretOff);
+  for(int l=0;l<n;l++){
+    int s=g_lineStart[l], e=s+g_lineLen[l];
+    if(e-s<lns) continue;
+    int p=s;
+    while(p<=e-lns){
+      if(g_text.compare(p,lns,name)==0){
+        bool okPrev=(p==0)||!isWordChar(g_text[p-1]);
+        bool okNext=(p+lns>=e)||!isWordChar(g_text[p+lns]);
+        if(okPrev&&okNext){
+          int sc=scoreDefinition(l,p,lns);
+          if(l==caretLine) sc-=1;                // 当前行略减分，偏向跳到别处的定义
+          if(sc>bestScore){ bestScore=sc; bestOff=p; }
+        }
+        p+=lns;
+      } else p++;
+    }
+  }
+  if(bestOff>=0 && bestScore>0){
+    g_selStart=bestOff; g_selEnd=bestOff+lns;    // 选中目标词，便于确认
+    setCaret(bestOff);                           // setCaret 自动滚动并移动系统光标
+  } else {
+    MessageBeep(0xFFFFFFFF);                      // 无定义可跳：提示音
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -2611,6 +2776,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         else if(wp=='F'){ toggleFind(); return 0; }
         else if(wp=='S'){ saveFile(); return 0; }
         else if(wp=='C'){
+          if(shift){ openTerminalHere(); return 0; } // Ctrl+Shift+C：在当前文件目录打开终端
           if(g_selStart>=0){ std::wstring sub=g_text.substr(g_selStart,g_selEnd-g_selStart);
             HGLOBAL hg=GlobalAlloc(GMEM_MOVEABLE,(sub.size()+1)*2);
             wchar_t* p=(wchar_t*)GlobalLock(hg); wcscpy_s(p,sub.size()+1,sub.c_str()); GlobalUnlock(hg);
@@ -2653,6 +2819,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           v+=page; if(v>=g_visualCount)v=g_visualCount-1; np=g_lineStart[g_visual[v].line]+std::min(col,(int)g_lineLen[g_visual[v].line]); break;
         }
         case VK_F3: doFind(true); return 0; // F3 重复上次查找
+        case VK_F12: gotoDefinition(selectedOrWordAtCaret()); return 0; // 跳转到定义
         // 轻量编辑：退格/删除/回车/制表符（均作用于编辑器文本，交给编辑函数处理并保持光标）
         case VK_BACK:   deleteChar(false); return 0;
         case VK_DELETE: deleteChar(true);  return 0;
@@ -2697,6 +2864,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else if(id==1402){ cutSelection(); }
       else if(id==1403){ pasteFromClipboard(); }
       else if(id==1404){ selectAll(); }
+      else if(id==1405){ openTerminalAndPasteSel(); } // 在命令提示符中打开（粘贴选中文本，不提交）
+      else if(id==1406){ gotoDefinition(selectedOrWordAtCaret()); } // 跳转到定义（函数/变量）
       // 标签栏右键菜单
       else if(id==1501){ if(g_ctxTab>=0) closeLeftTabs(g_ctxTab); }
       else if(id==1502){ if(g_ctxTab>=0) closeRightTabs(g_ctxTab); }
