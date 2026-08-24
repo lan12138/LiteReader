@@ -1,0 +1,3 @@
+// 应用图标资源：使 exe 文件图标（以及 cpp 等关联文件的图标）显示为 “LR”
+#define IDI_APPICON 101
+IDI_APPICON ICON "appicon.ico"
