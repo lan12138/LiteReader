@@ -83,11 +83,18 @@ std::vector<bool> g_tokDone;               // 对应行是否已经解析过 tok
 std::vector<Token> g_emptyToks;            // 空 token 列表（纯文本模式占位，避免每行临时构造）
 
 // 视图（全局共享，跨标签保持一致）
-bool g_dark = true;   // 默认深色模式
+bool g_dark = true;   // 当前主题的深浅标志（随主题切换自动同步，供 fileAccent 等两态逻辑使用）
+int  g_themeIdx = 0;  // 当前主题索引（见下方 g_themes 主题数组）
 bool g_wrap = false;  // 是否自动换行
 int  g_fontSize = 14; // 字号
+// 配置（.ini 持久化）：启动布局与用户偏好
+int  g_cfgX=0,g_cfgY=0,g_cfgW=0,g_cfgH=0,g_cfgMax=0,g_cfgSidebar=0;
+std::wstring g_cfgFolder;
+extern std::wstring g_folderPath;  // 根文件夹路径（定义见下方，供 loadConfig/saveConfig 引用）
+extern int g_sidebarW;             // 侧栏宽度（定义见下方）
 HFONT g_hFont = NULL; // 当前字体句柄（主编辑框，随 Ctrl+滚轮 变化）
 HFONT g_sideFont = NULL; // 侧栏（文件夹列表）专用字体，固定字号，不随编辑器字号变化
+HBITMAP g_caretBmp = NULL; // 光标纯色位图，随主题（TH.caret）惰性创建，切换主题时销毁重建
 int  g_charW = 8, g_lineH = 20;   // 单个字符像素宽、单行像素高（measureFont 时测算）
 int  g_gutterW = 56;              // 左侧行号区宽度
 int  g_topLine = 0;     // 第一条可见“视觉行”的索引（垂直滚动位置）
@@ -201,55 +208,150 @@ void restoreFrom(int i){
 }
 
 // ----------------------------------------------------------------------------
-// 颜色
+// 主题 / 颜色
 // ----------------------------------------------------------------------------
-// One Dark Pro 风格调色板。注意 COLORREF 内存布局为 0x00BBGGRR（B 在低位，R 在高位）。
+// 注意 COLORREF 内存布局为 0x00BBGGRR（B 在低位，R 在高位）。
 // 例如 0x00DD78C6：RR=DD GG=78 BB=C6，对应 #c678dd。
-COLORREF C_LIGHT[T_PREPROC+1] = {
-  0x002E2924, // TEXT
-  0x00A426A6, // KEYWORD (purple)
-  0x00016898, // TYPE (yellow-brown)
-  0x004AA150, // STRING (green)
-  0x00998F8B, // COMMENT (gray)
-  0x00164BCB, // NUMBER (orange)
-  0x005B18C2, // TAG (red)
-  0x00016898, // ATTR (yellow-brown)
-  0x004AA150, // AVAL (green)
-  0x002E2924, // IDENT
-  0x006A6057, // PUNCT
-  0x000000,   // BRACKET (overridden by rainbow)
-  0x00F27840, // FUNC (blue)
-  0x00164BCB, // PROC (orange)
-  0x00BC8401  // PREPROC (cyan-blue)
+// 每套主题自带完整配色（语法调色板 + 界面元素），切换主题即整体换肤。
+enum { NTHEMES = 5 };
+struct Theme {
+  const wchar_t* name;
+  bool dark;                       // 浅色/深色（驱动 fileAccent 等两态逻辑）
+  COLORREF c[T_PREPROC+1];        // 语法调色板：TEXT..PREPROC
+  COLORREF rb[6];                 // 彩虹括号（按嵌套深度取色）
+  COLORREF bg, gutterBg, gutterFg, selBg, matchBg, markBg, caret, selText, gutterLine;
+  COLORREF sbBg, sbHeaderBg, sbText, sbBtnText, sbBtnTextHover, sbFolderCol,
+           sbActiveBg, sbHoverBg, sbScrollbar, sbDivider, sbEmptyText;
+  COLORREF tabStripBg, tabDivider, tabBg, tabBgActive, tabAccent, tabText, tabTextActive, plusBg, plusText;
+  COLORREF findBg, findDivider, findIcon, findBtnBg, findBtnBgHover, findBtnBgPress, findBtnText, findCloseBg, findCloseHover;
+  COLORREF border, caption, captionText; // 窗口边框 / 标题栏 / 标题文字颜色（随主题）
 };
-COLORREF C_DARK[T_PREPROC+1] = {
-  0x00BFB2AB, // TEXT     (#abb2bf)
-  0x00DD78C6, // KEYWORD  (#c678dd)
-  0x007BC0E5, // TYPE     (#e5c07b)
-  0x0079C398, // STRING   (#98c379)
-  0x0070635C, // COMMENT  (#5c6370)
-  0x00669AD1, // NUMBER   (#d19a66)
-  0x00756CE0, // TAG      (#e06c75)
-  0x00669AD1, // ATTR     (#d19a66)
-  0x0079C398, // AVAL     (#98c379)
-  0x00BFB2AB, // IDENT    (#abb2bf)
-  0x00968A82, // PUNCT    (#828a96)
-  0x000000,   // BRACKET  (overridden by rainbow)
-  0x00EFAF61, // FUNC     (#61afef)
-  0x00669AD1, // PROC     (#d19a66)
-  0x00C2B656  // PREPROC  (#56b6c2)
+Theme g_themes[NTHEMES] = {
+  // 0 One Dark Pro（原默认深色）
+  { L"One Dark Pro", true,
+    { 0x00BFB2AB,0x00DD78C6,0x007BC0E5,0x0079C398,0x0070635C,0x00669AD1,0x00756CE0,0x00669AD1,0x0079C398,0x00BFB2AB,0x00968A82,0x00000000,0x00EFAF61,0x00669AD1,0x00C2B656 },
+    { 0x00756CE0,0x007BC0E5,0x0079C398,0x00C2B656,0x00EFAF61,0x00DD78C6 },
+    0x00342C28,0x002B2521,0x0070635C,0x0051443E,0x00525220,0x0046401A,0x00FFFFFF,0x00FFFFFF,0x00333333,
+    0x002B2521,0x001F1B18,0x009DA5B4,0x00888888,0x00FFFFFF,0x007BC0E5,0x00714709,0x002A2D2E,0x00545454,0x00000000,0x00666666,
+    0x00252526,0x003A3A3A,0x002D2D2D,0x001E1E1E,0x00569CD6,0x00C0C0C0,0x00FFFFFF,0x002D2D2D,0x00FFFFFF,
+    0x002B2521,0x003A3A3A,0x009DA5B4,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x003A3A3A,0x008A3B3B, 0x00252526,0x00252526,0x00D4D4D4 },
+  // 1 One Light（原默认浅色）
+  { L"One Light", false,
+    { 0x002E2924,0x00A426A6,0x00016898,0x004AA150,0x00998F8B,0x00164BCB,0x005B18C2,0x00016898,0x004AA150,0x002E2924,0x006A6057,0x00000000,0x00F27840,0x00164BCB,0x00BC8401 },
+    { 0x003439C2,0x000089B5,0x003B8A2F,0x00A3851A,0x00BF6F1F,0x00A34192 },
+    0x00FAFAFA,0x00F0F0F0,0x00999999,0x00FFE8CF,0x00A0F3FF,0x00BFE6C0,0x00000000,0x00000000,0x00E1E4E8,
+    0x00F3F3F3,0x00ECECEC,0x00444444,0x00999999,0x00000000,0x002D7DD2,0x00D2E7FF,0x00E6E6E6,0x00BFBFBF,0x00DADADA,0x00999999,
+    0x00F0F0F0,0x00D0D0D0,0x00E4E4E4,0x00FFFFFF,0x001976D2,0x00555555,0x00000000,0x00E4E4E4,0x00000000,
+    0x00F3F3F3,0x00D0D0D0,0x00555555,0x002F7FD1,0x004A95DD,0x001F5FA0,0x00FFFFFF,0x00D0D0D0,0x00C0392B, 0x00D0D0D0,0x00F3F3F3,0x00000000 },
+  // 2 VS Code Dark+（仿 VS Code 原生深色）
+  { L"VS Code", true,
+    { 0x00D4D4D4,0x00D69C56,0x00B0C94E,0x007891CE,0x0055996A,0x00A8CEB5,0x00D69C56,0x00FEDC9C,0x007891CE,0x00D4D4D4,0x00D4D4D4,0x00000000,0x00AADCDC,0x00AADCDC,0x00C0C686 },
+    { 0x00AAE0FF,0x00D69C56,0x00C0C686,0x007891CE,0x00B0C94E,0x00D19A66 },
+    0x001E1E1E,0x001E1E1E,0x00858585,0x00784F26,0x003D3737,0x0032323A,0x00FFFFFF,0x00FFFFFF,0x00202020,
+    0x00262526,0x00333333,0x00CCCCCC,0x00999999,0x00FFFFFF,0x00C5C5C5,0x003D3737,0x002A2D2E,0x00424242,0x00202020,0x00888888,
+    0x00252526,0x00202020,0x002D2D2D,0x001E1E1E,0x00CC7A00,0x00969696,0x00FFFFFF,0x002D2D2D,0x00FFFFFF,
+    0x00262526,0x00202020,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B, 0x00252526,0x00333333,0x00D4D4D4 },
+  // 3 IntelliJ IDEA（仿 IDEA 原生 Darcula 深色）
+  { L"IntelliJ IDEA", true,
+    { 0x00C6B7A9,0x003278CC,0x006DC6FF,0x0059876A,0x00808080,0x00BB9768,0x003278CC,0x00BABABA,0x0059876A,0x00C6B7A9,0x00C6B7A9,0x00000000,0x006DC6FF,0x006DC6FF,0x003278CC },
+    { 0x00C6B7A9,0x003278CC,0x00BB9768,0x0059876A,0x006DC6FF,0x00999999 },
+    0x002B2B2B,0x00353331,0x00909090,0x00834221,0x00714909,0x004A4946,0x00FFFFFF,0x00FFFFFF,0x00353536,
+    0x00353331,0x00353331,0x00A9B7C6,0x00888888,0x00FFFFFF,0x00A9B7C6,0x00302F2D,0x0036383A,0x005A5D5E,0x00262627,0x00888888,
+    0x00413F3C,0x00262627,0x0047474A,0x002B2B2B,0x003278CC,0x00A8B0BC,0x00FFFFFF,0x0047474A,0x00FFFFFF,
+    0x00353331,0x00262627,0x00A9B7C6,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B, 0x0047474A,0x0047474A,0x00A8B0BC },
+  // 4 极致黑（纯黑背景高对比）
+  { L"极致黑", true,
+    { 0x00FFFFFF,0x00FFC14F,0x00B0C94E,0x007891CE,0x0055996A,0x00A8CEB5,0x00FFC14F,0x00FEDC9C,0x007891CE,0x00FFFFFF,0x00E0E0E0,0x00000000,0x00AADCDC,0x00AADCDC,0x00C0C686 },
+    { 0x00FFC14F,0x00FEDC9C,0x00C0C686,0x007891CE,0x00B0C94E,0x00AADCDC },
+    0x00000000,0x00050505,0x00666666,0x00784F26,0x003A3A3A,0x002A2A2A,0x00FFFFFF,0x00FFFFFF,0x00222222,
+    0x00050505,0x000A0A0A,0x00CCCCCC,0x00888888,0x00FFFFFF,0x00FFC080,0x00141414,0x00101010,0x00333333,0x00181818,0x00888888,
+    0x00000000,0x00222222,0x00141414,0x00000000,0x00FFC14F,0x00CCCCCC,0x00FFFFFF,0x00141414,0x00FFFFFF,
+    0x00050505,0x00181818,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00181818,0x008A3B3B, 0x00222222,0x00050505,0x00FFFFFF },
 };
-// 彩虹括号配色：按嵌套深度 depth%6 取色，最多 6 种循环
-COLORREF RB_LIGHT[6] = {0x003439C2,0x000089B5,0x003B8A2F,0x00A3851A,0x00BF6F1F,0x00A34192};
-COLORREF RB_DARK[6]  = {0x00756CE0,0x007BC0E5,0x0079C398,0x00C2B656,0x00EFAF61,0x00DD78C6};
+#define TH (g_themes[g_themeIdx])
 
-// 以下为各界面元素的背景/前景色（依据深浅主题返回）
-COLORREF bgColor(){ return g_dark?0x00342C28:0x00FAFAFA; }   // 主背景 #282c34 / #fafafa
-COLORREF gutterBg(){ return g_dark?0x002B2521:0x00F0F0F0; }  // 行号区背景 #21252b / #f0f0f0
-COLORREF gutterFg(){ return g_dark?0x0070635C:0x00999999; }  // 行号文字 #5c6370 / #999999
-COLORREF selBg(){ return g_dark?0x0051443E:0x00FFE8CF; }     // 选区背景 #3E4451 / #cfe8ff
-COLORREF matchBg(){ return g_dark?0x00525220:0x00A0F3FF; }    // 括号配对背景 #525220 / #fff3a0
-COLORREF markBg(){ return g_dark?0x0046401A:0x00BFE6C0; }    // 分词高亮背景（暗：橄榄绿 / 亮：浅绿）
+// 以下为各界面元素的背景/前景色（依据当前主题返回）
+COLORREF bgColor(){ return TH.bg; }
+COLORREF gutterBg(){ return TH.gutterBg; }
+COLORREF gutterFg(){ return TH.gutterFg; }
+COLORREF selBg(){ return TH.selBg; }
+COLORREF matchBg(){ return TH.matchBg; }
+COLORREF markBg(){ return TH.markBg; }
+
+// ----------------------------------------------------------------------------
+// 配置（LiteReader.ini 持久化：主题 / 字号 / 启动布局）
+// ----------------------------------------------------------------------------
+std::wstring iniPath(){
+  wchar_t buf[MAX_PATH]; GetModuleFileName(NULL,buf,MAX_PATH);
+  std::wstring p(buf); size_t k=p.find_last_of(L'\\'); if(k!=std::wstring::npos) p=p.substr(0,k+1);
+  return p+L"LiteReader.ini";
+}
+void loadConfig(){
+  std::wstring ip=iniPath();
+  int t=GetPrivateProfileInt(L"Settings",L"theme",0,ip.c_str()); if(t<0||t>=NTHEMES)t=0;
+  g_themeIdx=t; g_dark=g_themes[t].dark;
+  int fs=GetPrivateProfileInt(L"Settings",L"fontsize",14,ip.c_str()); if(fs<9)fs=9; if(fs>28)fs=28; g_fontSize=fs;
+  g_cfgX=GetPrivateProfileInt(L"Settings",L"x",0,ip.c_str());
+  g_cfgY=GetPrivateProfileInt(L"Settings",L"y",0,ip.c_str());
+  g_cfgW=GetPrivateProfileInt(L"Settings",L"w",0,ip.c_str());
+  g_cfgH=GetPrivateProfileInt(L"Settings",L"h",0,ip.c_str());
+  g_cfgMax=GetPrivateProfileInt(L"Settings",L"max",0,ip.c_str());
+  int sb=GetPrivateProfileInt(L"Settings",L"sidebar",0,ip.c_str());
+  if(sb>=SIDEBAR_W_MIN && sb<=SIDEBAR_W_MAX) g_sidebarW=sb;
+  wchar_t fb[MAX_PATH];
+  if(GetPrivateProfileString(L"Settings",L"folder",L"",fb,MAX_PATH,ip.c_str())) g_cfgFolder=fb;
+}
+void saveConfig(){
+  std::wstring ip=iniPath();
+  g_cfgFolder=g_folderPath; // 始终持久化当前侧栏文件夹
+  if(g_hwnd){
+    WINDOWPLACEMENT wp={sizeof(wp)};
+    if(GetWindowPlacement(g_hwnd,&wp)){
+      RECT r=wp.rcNormalPosition;
+      g_cfgX=r.left; g_cfgY=r.top; g_cfgW=r.right-r.left; g_cfgH=r.bottom-r.top;
+      g_cfgMax=(wp.showCmd==SW_SHOWMAXIMIZED||wp.showCmd==SW_MAXIMIZE)?1:0;
+    }
+  }
+  auto W=[&](const wchar_t* k, int v){ std::wstring s=std::to_wstring(v); WritePrivateProfileString(L"Settings",k,s.c_str(),ip.c_str()); };
+  W(L"theme",g_themeIdx); W(L"fontsize",g_fontSize);
+  W(L"x",g_cfgX); W(L"y",g_cfgY); W(L"w",g_cfgW); W(L"h",g_cfgH); W(L"max",g_cfgMax);
+  if(g_sidebarW>=SIDEBAR_W_MIN && g_sidebarW<=SIDEBAR_W_MAX) W(L"sidebar",g_sidebarW);
+  WritePrivateProfileString(L"Settings",L"folder", g_cfgFolder.empty()?L"":g_cfgFolder.c_str(), ip.c_str());
+  WritePrivateProfileString(L"Settings",L"version",L"1",ip.c_str());
+}
+void applyThemeToFrame(); // 前向声明（定义见下方）
+void setTheme(int i){
+  if(i<0||i>=NTHEMES) i=0;
+  g_themeIdx=i; g_dark=g_themes[i].dark;
+  if(g_caretBmp){ DeleteObject(g_caretBmp); g_caretBmp=NULL; } // 切换主题后重建光标位图
+  invalidateLineCache();
+  if(g_hwnd){ InvalidateRect(g_hwnd,NULL,TRUE); applyThemeToFrame(); }
+}
+// 让窗口边框/标题栏/标题文字颜色随当前主题变化（DWM 属性，需 Windows 11；旧系统静默忽略）
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+void applyThemeToFrame(){
+  if(!g_hwnd) return;
+  HMODULE h=LoadLibraryW(L"dwmapi.dll"); if(!h) return;
+  typedef HRESULT (WINAPI* DswSetAttr)(HWND,DWORD,const void*,DWORD);
+  DswSetAttr fn=(DswSetAttr)GetProcAddress(h,"DwmSetWindowAttribute");
+  if(fn){
+    COLORREF b=TH.border, c=TH.caption, t=TH.captionText;
+    fn(g_hwnd,DWMWA_BORDER_COLOR,&b,sizeof(b));   // 窗口边框（1px 外框）
+    fn(g_hwnd,DWMWA_CAPTION_COLOR,&c,sizeof(c));  // 标题栏背景
+    fn(g_hwnd,DWMWA_TEXT_COLOR,&t,sizeof(t));     // 标题文字
+    // 强制重绘非客户区，使新边框/标题栏色立即生效
+    RedrawWindow(g_hwnd,NULL,NULL,RDW_FRAME|RDW_INVALIDATE|RDW_UPDATENOW);
+  }
+  FreeLibrary(h);
+}
 
 // ----------------------------------------------------------------------------
 // 工具函数
@@ -392,10 +494,9 @@ void collectMarks(){
   }
 }
 // 自绘一个圆角按钮（用于查找条的“上一项/下一项”）
-void drawFindButton(HDC hdc, RECT r, const wchar_t* text, bool hover, bool pressed, bool dark){
-  COLORREF base = dark?0x3A6EA5:0x2F7FD1;                 // 默认蓝
-  COLORREF col  = pressed ? (dark?0x2A5278:0x1F5FA0)
-                : (hover  ? (dark?0x4A82BE:0x4A95DD) : base);
+void drawFindButton(HDC hdc, RECT r, const wchar_t* text, bool hover, bool pressed){
+  COLORREF base = TH.findBtnBg;
+  COLORREF col  = pressed ? TH.findBtnBgPress : (hover ? TH.findBtnBgHover : base);
   HBRUSH b=CreateSolidBrush(col);
   HPEN   p=CreatePen(PS_SOLID,1,col);                    // 边框同色，避免深色描边
   HPEN   op=(HPEN)SelectObject(hdc,p);
@@ -404,12 +505,12 @@ void drawFindButton(HDC hdc, RECT r, const wchar_t* text, bool hover, bool press
   SelectObject(hdc,op); DeleteObject(p);
   SelectObject(hdc,ob); DeleteObject(b);
   SetBkMode(hdc,TRANSPARENT);
-  SetTextColor(hdc,RGB(255,255,255));
+  SetTextColor(hdc,TH.findBtnText);
   DrawText(hdc,text,-1,&r,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
 }
 // 自绘关闭按钮（×）：普通为中性灰，悬停时变红
-void drawFindCloseBtn(HDC hdc, RECT r, bool hover, bool pressed, bool dark){
-  COLORREF col = hover ? (dark?0x8A3B3B:0xC0392B) : (dark?0x3A3A3A:0xD0D0D0);
+void drawFindCloseBtn(HDC hdc, RECT r, bool hover, bool pressed){
+  COLORREF col = hover ? TH.findCloseHover : TH.findCloseBg;
   HBRUSH b=CreateSolidBrush(col);
   HPEN   p=CreatePen(PS_SOLID,1,col);
   HPEN   op=(HPEN)SelectObject(hdc,p);
@@ -418,7 +519,7 @@ void drawFindCloseBtn(HDC hdc, RECT r, bool hover, bool pressed, bool dark){
   SelectObject(hdc,op); DeleteObject(p);
   SelectObject(hdc,ob); DeleteObject(b);
   SetBkMode(hdc,TRANSPARENT);
-  SetTextColor(hdc, hover ? RGB(255,255,255) : (dark?RGB(200,200,200):RGB(60,60,60)));
+  SetTextColor(hdc, hover ? RGB(255,255,255) : TH.tabText);
   DrawText(hdc,L"×",1,&r,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
 }
 
@@ -984,7 +1085,16 @@ void updateCaretPos(){
   if(g_wrap){ x = leftBar()+g_gutterW + linePrefixPx(line, g_caretOff-g_lineStart[line]) - linePrefixPx(line, g_visual[vline].col); }
   else { x = leftBar()+g_gutterW + linePrefixPx(line, g_caretOff-g_lineStart[line]) - g_scrollX; } // 非换行按水平滚动偏移
   DestroyCaret();
-  if(CreateCaret(g_hwnd,NULL,2,g_lineH-2)){
+  if(!g_caretBmp){ // 惰性创建与主题色一致的纯色光标位图
+    int cw=2, ch=g_lineH-2; if(ch<1) ch=1;
+    HDC hdc=GetDC(g_hwnd), mdc=CreateCompatibleDC(hdc); ReleaseDC(g_hwnd,hdc);
+    g_caretBmp=CreateCompatibleBitmap(mdc,cw,ch);
+    HBITMAP ob=(HBITMAP)SelectObject(mdc,g_caretBmp);
+    HBRUSH br=CreateSolidBrush(TH.caret); HBRUSH obr=(HBRUSH)SelectObject(mdc,br);
+    RECT rc={0,0,cw,ch}; FillRect(mdc,&rc,br);
+    SelectObject(mdc,ob); SelectObject(mdc,obr); DeleteObject(br); DeleteDC(mdc);
+  }
+  if(CreateCaret(g_hwnd,g_caretBmp,0,0)){ // 传入位图后宽高参数被忽略
     SetCaretPos(x,y); ShowCaret(g_hwnd);
   }
 }
@@ -1254,24 +1364,24 @@ void drawSidebar(HDC mem, const RECT& rc){
   int lb=leftBar();
   int eTop=editorTop();
   // 背景（从标签栏下沿 TAB_H 起，覆盖查找条左侧的留白带，避免缝隙）
-  COLORREF sbBg = g_dark?0x002B2521:0x00F3F3F3;
+  COLORREF sbBg = TH.sbBg;
   RECT sbrc={0,TAB_H,lb,rc.bottom};
   HBRUSH bb=CreateSolidBrush(sbBg); FillRect(mem,&sbrc,bb); DeleteObject(bb);
   // 头部
   RECT hdr={0,eTop,lb,eTop+SIDEBAR_HEAD_H};
-  HBRUSH hb=CreateSolidBrush(g_dark?0x001F1B18:0x00ECECEC); FillRect(mem,&hdr,hb); DeleteObject(hb);
+  HBRUSH hb=CreateSolidBrush(TH.sbHeaderBg); FillRect(mem,&hdr,hb); DeleteObject(hb);
   SetBkMode(mem,TRANSPARENT);
   std::wstring fn=g_folderPath.substr(g_folderPath.find_last_of(L'\\')+1);
   if(fn.empty()) fn=g_folderPath; // 驱动器根目录时兜底显示完整路径
   RECT tr={8,eTop,lb-24,eTop+SIDEBAR_HEAD_H};
-  SetTextColor(mem, g_dark?0x9DA5B4:0x444444);
+  SetTextColor(mem, TH.sbText);
   DrawText(mem,fn.c_str(),(int)fn.size(),&tr,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
   RECT cr={lb-22,eTop+6,lb-4,eTop+6+18};
-  SetTextColor(mem, (g_sideHoverBtn==1)?(g_dark?0xFFFFFF:0x000000):(g_dark?0x888888:0x999999));
+  SetTextColor(mem, (g_sideHoverBtn==1)?TH.sbBtnTextHover:TH.sbBtnText);
   DrawText(mem,L"×",1,&cr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
   // 树行
   int sbTop=eTop+SIDEBAR_HEAD_H;
-  COLORREF folderCol = g_dark?RGB(123,192,229):RGB(45,125,210);  // 文件夹统一用文件夹蓝
+  COLORREF folderCol = TH.sbFolderCol;  // 文件夹统一用文件夹蓝
   for(size_t i=0;i<g_treeRows.size();i++){
     int y=sbTop+(int)i*SIDEBAR_ROW_H-g_treeScroll;
     if(y+SIDEBAR_ROW_H<sbTop) continue;
@@ -1281,33 +1391,32 @@ void drawSidebar(HDC mem, const RECT& rc){
     bool hover=(g_sidebarHover==(int)i);
     if(active||hover){
       RECT rr={0,y,lb,y+SIDEBAR_ROW_H};
-      HBRUSH hb2=CreateSolidBrush(active?(g_dark?0x00714709:0x00D2E7FF):(g_dark?0x002A2D2E:0x00E6E6E6));
+      HBRUSH hb2=CreateSolidBrush(active?TH.sbActiveBg:TH.sbHoverBg);
       FillRect(mem,&rr,hb2); DeleteObject(hb2);
     }
     int indent=10+n->depth*SIDEBAR_INDENT;
     COLORREF col;
     if(n->isDir){
       col=folderCol;
-      drawTreeTri(mem,indent,y+SIDEBAR_ROW_H/2,n->expanded, g_dark?RGB(157,165,180):RGB(85,85,85));
+      drawTreeTri(mem,indent,y+SIDEBAR_ROW_H/2,n->expanded, TH.sbBtnText);
       drawFolderIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-12)/2),col);
     } else {
       col=fileAccent(extToLang(fileExtLower(n->name)), g_dark); // 按文件类型着色
       drawFileIcon(mem,indent+14,(y+(SIDEBAR_ROW_H-13)/2),col);
     }
     RECT nr={indent+14+16, y, lb-4, y+SIDEBAR_ROW_H};
-    COLORREF txtCol = active ? (g_dark?RGB(255,255,255):RGB(0,0,0))
-                   : hover  ? (g_dark?RGB(255,255,255):RGB(0,0,0))
-                   : (n->isDir ? (g_dark?RGB(157,165,180):RGB(50,50,50)) : col); // 文件名为类型色，目录为中性灰
+    COLORREF txtCol = active||hover ? TH.sbText
+                   : (n->isDir ? TH.sbBtnText : col); // 文件名为类型色，目录为中性灰
     SetTextColor(mem, txtCol);
     DrawText(mem,n->name.c_str(),(int)n->name.size(),&nr,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
   }
   if(g_treeRows.empty()){
     RECT er={8,sbTop+6,lb-8,sbTop+24};
-    SetTextColor(mem, g_dark?0x666666:0x999999);
+    SetTextColor(mem, TH.sbEmptyText);
     DrawText(mem,L"（空文件夹）",-1,&er,DT_LEFT|DT_SINGLELINE|DT_NOPREFIX);
   }
   // 分隔线（侧栏与编辑器之间）
-  HPEN sp=CreatePen(PS_SOLID,1,g_dark?0x000000:0xDADADA); HPEN op=(HPEN)SelectObject(mem,sp);
+  HPEN sp=CreatePen(PS_SOLID,1,TH.sbDivider); HPEN op=(HPEN)SelectObject(mem,sp);
   MoveToEx(mem,lb,TAB_H,NULL); LineTo(mem,lb,rc.bottom); SelectObject(mem,op); DeleteObject(sp);
   // 树滚动条滑块
   int viewH=rc.bottom-sbTop; int contentH=(int)g_treeRows.size()*SIDEBAR_ROW_H;
@@ -1316,7 +1425,7 @@ void drawSidebar(HDC mem, const RECT& rc){
     int thumbH=std::max(20,(int)((double)viewH/contentH*viewH));
     int thumbY=sbTop+(int)((double)g_treeScroll/maxScroll*(viewH-thumbH));
     RECT thr={lb-11,thumbY,lb-2,thumbY+thumbH};
-    HBRUSH tb=CreateSolidBrush(g_dark?0x00545454:0x00BFBFBF); FillRect(mem,&thr,tb); DeleteObject(tb);
+    HBRUSH tb=CreateSolidBrush(TH.sbScrollbar); FillRect(mem,&thr,tb); DeleteObject(tb);
   }
   SelectObject(mem,oldSideFnt); // 还原缓冲区原字体（主编辑框用 g_hFont）
 }
@@ -1363,11 +1472,11 @@ void ensureActiveTabVisible(){
 // 绘制顶部标签栏（各文档标签按名称动态宽度 + 新建按钮钉在最右），覆盖在最上方一行。
 void drawTabBar(HDC mem, const RECT& rc){
   clampTabScroll(); // 窗口变宽后把标签滚回可视区，避免标签“卡”在滚动偏移处
-  COLORREF stripBg = g_dark?0x252526:0xF0F0F0;
+  COLORREF stripBg = TH.tabStripBg;
   HBRUSH sb=CreateSolidBrush(stripBg); FillRect(mem,&rc,sb); DeleteObject(sb);
   // 标签栏底部分隔线（贯穿到加号按钮左侧）
   int stripRight=rc.right-PLUS_W; if(stripRight<0)stripRight=0;
-  HPEN bp=CreatePen(PS_SOLID,1,g_dark?0x3A3A3A:0xD0D0D0); HPEN op=(HPEN)SelectObject(mem,bp);
+  HPEN bp=CreatePen(PS_SOLID,1,TH.tabDivider); HPEN op=(HPEN)SelectObject(mem,bp);
   MoveToEx(mem,0,TAB_H-1,NULL); LineTo(mem,stripRight,TAB_H-1); SelectObject(mem,op); DeleteObject(bp);
 
   int n=(int)g_docs.size();
@@ -1382,20 +1491,20 @@ void drawTabBar(HDC mem, const RECT& rc){
     if(cx>=stripRight) break;          // 已超出条带右界，后续不再可见
     RECT tr={cx,0,cx+w,TAB_H};
     bool act=(i==g_active);
-    COLORREF tb = act? (g_dark?0x1E1E1E:0xFFFFFF) : (g_dark?0x2D2D2D:0xE4E4E4); // 激活标签背景更亮
+    COLORREF tb = act? TH.tabBgActive : TH.tabBg; // 激活标签背景更亮
     HBRUSH tbk=CreateSolidBrush(tb); FillRect(mem,&tr,tbk); DeleteObject(tbk);
     if(act){
       // 激活标签底部画一条强调色横线
-      HPEN ap=CreatePen(PS_SOLID,2,g_dark?0x569CD6:0x1976D2); HPEN ao=(HPEN)SelectObject(mem,ap);
+      HPEN ap=CreatePen(PS_SOLID,2,TH.tabAccent); HPEN ao=(HPEN)SelectObject(mem,ap);
       MoveToEx(mem,cx,TAB_H-1,NULL); LineTo(mem,cx+w,TAB_H-1); SelectObject(mem,ao); DeleteObject(ap);
     }
     std::wstring t=tabTitle(i);
     RECT tr2={cx+6,0,cx+w-TAB_CLOSE_W-6,TAB_H};
-    SetTextColor(mem, act? (g_dark?0xFFFFFF:0x000000) : (g_dark?0xC0C0C0:0x555555));
+    SetTextColor(mem, act? TH.tabTextActive : TH.tabText);
     DrawText(mem,t.c_str(),(int)t.size(),&tr2,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     // 关闭按钮 ×
     RECT cr={cx+w-TAB_CLOSE_W,4,cx+w-4,TAB_H-4};
-    SetTextColor(mem, g_dark?0xAAAAAA:0x888888);
+    SetTextColor(mem, TH.tabText);
     DrawText(mem,L"×",1,&cr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
     cx+=w;
   }
@@ -1403,8 +1512,8 @@ void drawTabBar(HDC mem, const RECT& rc){
 
   // “新建标签”按钮（+）钉在最右侧，始终可见
   RECT pr={rc.right-PLUS_W,2,rc.right-2,TAB_H-2};
-  HBRUSH pb=CreateSolidBrush(g_dark?0x2D2D2D:0xE4E4E4); FillRect(mem,&pr,pb); DeleteObject(pb);
-  SetBkMode(mem,TRANSPARENT); SetTextColor(mem, g_dark?0xFFFFFF:0x000000);
+  HBRUSH pb=CreateSolidBrush(TH.plusBg); FillRect(mem,&pr,pb); DeleteObject(pb);
+  SetBkMode(mem,TRANSPARENT); SetTextColor(mem, TH.plusText);
   DrawText(mem,L"+",1,&pr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
   SetBkMode(mem,OPAQUE);
 }
@@ -1432,7 +1541,7 @@ void renderLineBase(HDC hdc, int v){
   COLORREF bg=bgColor();
   SetBkMode(hdc,OPAQUE); SetBkColor(hdc,bg);
   HBRUSH bgBr=CreateSolidBrush(bg); RECT br={0,0,w,g_lineH}; FillRect(hdc,&br,bgBr); DeleteObject(bgBr);
-  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  COLORREF* pal=TH.c;
   std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
   if(g_langId!=L_TXT){
     const std::vector<Token>& toks=lineTokens(line);
@@ -1447,7 +1556,7 @@ void renderLineBase(HDC hdc, int v){
     int j=k+1;
     while(j<len && ttype[j]==ty && tcol[j]==tc) j++;
     int segLen=j-k;
-    COLORREF fg=(ty==T_BRACKET)?(g_dark?RB_DARK[tc]:RB_LIGHT[tc]):pal[ty];
+    COLORREF fg=(ty==T_BRACKET)?TH.rb[tc]:pal[ty];
     SetTextColor(hdc,fg);
     RECT clip={0,0,w,g_lineH};
     ExtTextOut(hdc,x,0,ETO_CLIPPED,&clip,g_text.c_str()+base+k,segLen,NULL);
@@ -1459,7 +1568,7 @@ void renderLineBase(HDC hdc, int v){
 void drawLineDirect(HDC hdc, int v, int x, int y, int clipR){
   const Visual& vis=g_visual[v];
   int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
-  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  COLORREF* pal=TH.c;
   COLORREF bg=bgColor();
   const std::vector<Token>& toks=(g_langId==L_TXT)? g_emptyToks : lineTokens(line);
   std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
@@ -1485,7 +1594,7 @@ void drawLineDirect(HDC hdc, int v, int x, int y, int clipR){
       j++;
     }
     int segLen=j-k;
-    COLORREF fg=(ty==T_BRACKET)?(g_dark?RB_DARK[tc]:RB_LIGHT[tc]):pal[ty];
+    COLORREF fg=(ty==T_BRACKET)?TH.rb[tc]:pal[ty];
     COLORREF bk=bg;
     if(mt) bk=matchBg(); else if(sel) bk=selBg(); else if(mk) bk=markBg();
     int runW=runPx(base+k,segLen);
@@ -1493,7 +1602,7 @@ void drawLineDirect(HDC hdc, int v, int x, int y, int clipR){
       RECT segR={x-1,y,x+runW+1,y+g_lineH};
       HBRUSH hb=CreateSolidBrush(bk); FillRect(hdc,&segR,hb); DeleteObject(hb);
     }
-    SetTextColor(hdc, sel? (g_dark?0xFFFFFF:0x000000) : fg);
+    SetTextColor(hdc, sel? TH.selText : fg);
     SetBkColor(hdc,bk);
     ExtTextOut(hdc,x,y,ETO_CLIPPED,&lineClip,g_text.c_str()+base+k,segLen,NULL);
     x+=runW; k=j;
@@ -1504,7 +1613,7 @@ void drawLineDirect(HDC hdc, int v, int x, int y, int clipR){
 void drawLineOverlay(HDC hdc, int v, int x, int y, int clipR){
   const Visual& vis=g_visual[v];
   int line=vis.line; int base=g_lineStart[line]+vis.col; int len=vis.len;
-  COLORREF* pal=g_dark?C_DARK:C_LIGHT;
+  COLORREF* pal=TH.c;
   COLORREF bg=bgColor();
   std::vector<unsigned char> ttype(len,T_TEXT), tcol(len,0);
   if(g_langId!=L_TXT){
@@ -1537,11 +1646,11 @@ void drawLineOverlay(HDC hdc, int v, int x, int y, int clipR){
       HBRUSH hb=CreateSolidBrush(bk); FillRect(hdc,&segR,hb); DeleteObject(hb);
     }
     if(sel){
-      SetTextColor(hdc, g_dark?0xFFFFFF:0x000000); SetBkColor(hdc,bk);
+      SetTextColor(hdc, TH.selText); SetBkColor(hdc,bk);
       RECT lc={leftBar()+g_gutterW,y,clipR,y+g_lineH};
       ExtTextOut(hdc,x,y,ETO_CLIPPED,&lc,g_text.c_str()+base+k,segLen,NULL);
     } else if(mt||mk){
-      COLORREF fg=(ttype[k]==T_BRACKET)?(g_dark?RB_DARK[tcol[k]]:RB_LIGHT[tcol[k]]):pal[ttype[k]];
+      COLORREF fg=(ttype[k]==T_BRACKET)?TH.rb[tcol[k]]:pal[ttype[k]];
       SetTextColor(hdc,fg); SetBkColor(hdc,bk);
       RECT lc={leftBar()+g_gutterW,y,clipR,y+g_lineH};
       ExtTextOut(hdc,x,y,ETO_CLIPPED,&lc,g_text.c_str()+base+k,segLen,NULL);
@@ -1670,20 +1779,20 @@ static void scrollByLines(int delta){
 static void drawFindBar(HDC mem, RECT rc){
   int by=TAB_H, bh=FIND_H;
   RECT fbr={leftBar(),by,rc.right,by+bh};
-  COLORREF fb = g_dark?0x002B2521:0x00F3F3F3;
+  COLORREF fb = TH.findBg;
   HBRUSH fbk=CreateSolidBrush(fb); FillRect(mem,&fbr,fbk); DeleteObject(fbk);
-  HPEN sp=CreatePen(PS_SOLID,1,g_dark?0x3A3A3A:0xD0D0D0); HPEN sop=(HPEN)SelectObject(mem,sp);
+  HPEN sp=CreatePen(PS_SOLID,1,TH.findDivider); HPEN sop=(HPEN)SelectObject(mem,sp);
   MoveToEx(mem,0,by+bh-1,NULL); LineTo(mem,rc.right,by+bh-1);
   SelectObject(mem,sop); DeleteObject(sp);
   int mx=leftBar()+g_gutterW+10, my=by+bh/2, rad=6;
-  HPEN ip=CreatePen(PS_SOLID,2,g_dark?0x9DA5B4:0x555555); HPEN iop=(HPEN)SelectObject(mem,ip);
+  HPEN ip=CreatePen(PS_SOLID,2,TH.findIcon); HPEN iop=(HPEN)SelectObject(mem,ip);
   HBRUSH ib=(HBRUSH)GetStockObject(NULL_BRUSH); HBRUSH ibo=(HBRUSH)SelectObject(mem,ib);
   Ellipse(mem,mx-rad,my-rad,mx+rad,my+rad);
   MoveToEx(mem,mx+rad-2,my+rad-2,NULL); LineTo(mem,mx+rad+3,my+rad+3);
   SelectObject(mem,iop); DeleteObject(ip); SelectObject(mem,ibo);
-  drawFindButton(mem,g_rPrev,L"上一项", g_findHover==1, g_findPress==1, g_dark);
-  drawFindButton(mem,g_rNext,L"下一项", g_findHover==2, g_findPress==2, g_dark);
-  drawFindCloseBtn(mem,g_rClose, g_findHover==3, g_findPress==3, g_dark);
+  drawFindButton(mem,g_rPrev,L"上一项", g_findHover==1, g_findPress==1);
+  drawFindButton(mem,g_rNext,L"下一项", g_findHover==2, g_findPress==2);
+  drawFindCloseBtn(mem,g_rClose, g_findHover==3, g_findPress==3);
 }
 
 void paint(){
@@ -1723,7 +1832,7 @@ void paint(){
     // 行号区（覆盖在文本之上，遮挡横向滚动溢出的文本）
     RECT grc={leftBar(), y0, leftBar()+g_gutterW, y1};
     HBRUSH gbBr=CreateSolidBrush(gb); FillRect(mem,&grc,gbBr); DeleteObject(gbBr);
-    HPEN pen=CreatePen(PS_SOLID,1,g_dark?0x333333:0xE1E4E8);
+    HPEN pen=CreatePen(PS_SOLID,1,TH.findDivider);
     HPEN op=(HPEN)SelectObject(mem,pen);
     MoveToEx(mem,leftBar()+g_gutterW,y0,NULL); LineTo(mem,leftBar()+g_gutterW,y1);
     SelectObject(mem,op); DeleteObject(pen);
@@ -2127,7 +2236,13 @@ void createMenu(HMENU& hMenu){
   AppendMenu(hMenu,MF_POPUP,(UINT_PTR)hEdit,L"编辑");
 
   HMENU hView=CreatePopupMenu();
-  AppendMenu(hView,MF_STRING,1201,L"明暗主题");
+  HMENU hTheme=CreatePopupMenu();
+  AppendMenu(hTheme,MF_STRING,1250,L"One Dark Pro");
+  AppendMenu(hTheme,MF_STRING,1251,L"One Light");
+  AppendMenu(hTheme,MF_STRING,1252,L"VS Code");
+  AppendMenu(hTheme,MF_STRING,1253,L"IntelliJ IDEA");
+  AppendMenu(hTheme,MF_STRING,1254,L"极致黑");
+  AppendMenu(hView,MF_POPUP,(UINT_PTR)hTheme,L"主题");
   AppendMenu(hView,MF_STRING,1202,L"自动换行");
   AppendMenu(hView,MF_STRING,1203,L"字体 +");
   AppendMenu(hView,MF_STRING,1204,L"字体 -");
@@ -2158,9 +2273,11 @@ void checkMenu(HMENU hMenu){
   else if(g_lang==L"json")idx=6; else if(g_lang==L"python")idx=7; else if(g_lang==L"css")idx=8;
   else if(g_lang==L"c")idx=9; else if(g_lang==L"cpp")idx=10; else if(g_lang==L"java")idx=11; else if(g_lang==L"aspx")idx=12; else if(g_lang==L"xml")idx=13;
   HMENU hView=GetSubMenu(hMenu,2);   // 视图菜单是第 3 个（索引 2）
-  HMENU hLang=GetSubMenu(hView,5);   // 语言子菜单在视图内第 6 个（索引 5）
+  HMENU hTheme=GetSubMenu(hView,0);  // 主题子菜单（视图内第 1 项，索引 0）
+  HMENU hLang=GetSubMenu(hView,4);   // 语言子菜单（视图内第 5 项，索引 4）
   for(int i=0;i<14;i++) CheckMenuItem(hLang,langMap[i],(i==idx)?MF_CHECKED:MF_UNCHECKED);
   CheckMenuItem(hView,1202,g_wrap?MF_CHECKED:MF_UNCHECKED); // 自动换行勾选
+  for(int i=0;i<5;i++) CheckMenuItem(hTheme,1250+i,(i==g_themeIdx)?MF_CHECKED:MF_UNCHECKED); // 当前主题勾选
 }
 
 // ----------------------------------------------------------------------------
@@ -2303,11 +2420,14 @@ std::wstring currentDir(){
   wchar_t buf[MAX_PATH]={0};
   return (SHGetFolderPathW(NULL,CSIDL_PERSONAL,NULL,0,buf)==S_OK)? std::wstring(buf) : std::wstring(L"C:\\");
 }
-void openTerminalHere(){
+// 打开外部终端：优先 Windows Terminal（wt.exe），其次 PowerShell，最后 cmd。
+// 任一成功即返回 true；全部失败返回 false。
+static bool openTerminalHere(){
   std::wstring dir=currentDir();
-  if(launchTerminal(L"wt.exe", L"-d \""+dir+L"\"", dir)) return;        // Windows Terminal：用 -d 指定起始目录
-  if(launchTerminal(L"powershell.exe", L"", dir)) return;               // PowerShell：起始目录即工作目录
-  if(launchTerminal(L"cmd.exe", L"", dir)) return;                      // 兜底 cmd
+  if(launchTerminal(L"wt.exe", L"-d \""+dir+L"\"", dir)) return true;   // Windows Terminal：用 -d 指定起始目录
+  if(launchTerminal(L"powershell.exe", L"", dir)) return true;          // PowerShell：起始目录即工作目录
+  if(launchTerminal(L"cmd.exe", L"", dir)) return true;                 // 兜底 cmd
+  return false;
 }
 // 查找“已经打开”的终端窗口：枚举顶层窗口，匹配控制台类（cmd/PowerShell 的 conhost）或 Windows Terminal
 struct TermEnumCtx { HWND found; };
@@ -2337,16 +2457,19 @@ void openTerminalAndPasteSel(){
   if(g_selStart>=0) sel=g_text.substr(g_selStart,g_selEnd-g_selStart);
   HWND term=findOpenTerminal();
   if(!term){               // 没有已开的终端 → 在本文件目录新开一个
-    openTerminalHere();
-    Sleep(500);            // 等窗口真正创建出来
-    term=findOpenTerminal();
+    AllowSetForegroundWindow(ASFW_ANY); // 允许新启动的终端进程抢占前台（绕过前台锁）
+    bool ok=openTerminalHere();
+    if(ok){                // 轮询等待终端窗口真正出现（最多 ~2 秒），避免固定 500ms 可能错过启动较慢的终端
+      for(int i=0;i<20 && !term;i++){ Sleep(100); term=findOpenTerminal(); }
+    }
   }
-  if(!term) return;
+  if(!term) return;        // 仍找不到（如终端启动失败）→ 静默退出
   if(IsIconic(term)) ShowWindow(term,SW_RESTORE);
-  SetForegroundWindow(term);
+  ShowWindow(term,SW_SHOW);
+  SetForegroundWindow(term);                 // 确保终端被拉到前台并获焦
   if(sel.empty()) return;  // 没有选中内容则仅打开，不粘贴
   setClipboardText(sel);   // 放到剪贴板，终端里 Ctrl+V 即粘贴（且不回车）
-  Sleep(80);               // 等窗口拿到焦点
+  Sleep(120);              // 等窗口拿到焦点并就绪
   INPUT inp[4]={0};
   inp[0].type=INPUT_KEYBOARD; inp[0].ki.wVk=VK_CONTROL;
   inp[1].type=INPUT_KEYBOARD; inp[1].ki.wVk='V';
@@ -2784,6 +2907,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           }
           return 0;
         }
+        else if(wp=='X'){ cutSelection(); return 0; }                  // Ctrl+X 剪切
+        else if(wp=='V'){ pasteFromClipboard(); return 0; }            // Ctrl+V 粘贴
         else if(wp=='A'){ g_selStart=0; g_selEnd=(int)g_text.size(); g_anchorOff=0; g_caretOff=(int)g_text.size(); InvalidateRect(hwnd,NULL,TRUE); return 0; }
         else if(wp=='Z'){ if(shift) redo(); else undo(); return 0; } // Ctrl+Z 撤销；Ctrl+Shift+Z 重做
         else if(wp=='Y'){ redo(); return 0; }                       // Ctrl+Y 重做
@@ -2870,7 +2995,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else if(id==1501){ if(g_ctxTab>=0) closeLeftTabs(g_ctxTab); }
       else if(id==1502){ if(g_ctxTab>=0) closeRightTabs(g_ctxTab); }
       else if(id==1503){ if(g_ctxTab>=0) closeOtherTabs(g_ctxTab); }
-      else if(id==1201){ g_dark=!g_dark; invalidateLineCache(); InvalidateRect(hwnd,NULL,TRUE); } // 切换深浅主题
+      else if(id>=1250 && id<=1254){ setTheme(id-1250); saveConfig(); } // 切换主题并持久化
       else if(id==1202){ g_wrap=!g_wrap; buildVisual(); invalidateLineCache(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); }
       else if(id==1203){ g_fontSize++; if(g_fontSize>28)g_fontSize=28; ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos(); }
       else if(id==1204){ g_fontSize--; if(g_fontSize<9)g_fontSize=9; ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos(); }
@@ -2886,6 +3011,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       }
       return 0;
     }
+    case WM_CLOSE: saveConfig(); DestroyWindow(hwnd); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
   }
   return DefWindowProc(hwnd,msg,wp,lp);
@@ -3023,6 +3149,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
   g_hInst = hInstance;
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE); // 供 SHBrowseForFolder 使用
   initKeywords(); // 先灌入关键字表
+  loadConfig();    // 读入上次配置：主题 / 字号 / 侧栏宽 / 窗口布局 / 上次文件夹
 
   // ---- 单实例：若已存在窗口，把命令行文件发给它并激活，不另开进程 ----
   HANDLE hMutex=CreateMutexW(NULL,TRUE,L"LiteReaderSingleInstance_v1");
@@ -3056,8 +3183,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     CW_USEDEFAULT,CW_USEDEFAULT,900,640,NULL,NULL,hInstance,NULL);
   HMENU hMenu; createMenu(hMenu); SetMenu(g_hwnd,hMenu);
   setAppIcon(g_hwnd); // 运行时绘制 “LR” 图标（不引用任何图片文件，保持单 cpp）
-  ShowWindow(g_hwnd, nCmdShow);
+
+  // 恢复上次窗口布局（位置/大小，以及是否最大化）
+  if(g_cfgMax==1){
+    ShowWindow(g_hwnd,SW_SHOWMAXIMIZED);
+  } else if(g_cfgW>0 && g_cfgH>0){
+    SetWindowPos(g_hwnd,NULL,g_cfgX,g_cfgY,g_cfgW,g_cfgH,SWP_NOZORDER|SWP_NOACTIVATE);
+    ShowWindow(g_hwnd, nCmdShow);
+  } else {
+    ShowWindow(g_hwnd, nCmdShow);
+  }
   UpdateWindow(g_hwnd);
+  applyThemeToFrame(); // 让窗口边框/标题栏颜色匹配当前主题
+
+  // 重新打开上次文件夹（侧栏）
+  if(!g_cfgFolder.empty()) openFolder(g_cfgFolder);
 
   // 命令行参数 = 要打开的文件（载入首个标签）
   int argc; LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
