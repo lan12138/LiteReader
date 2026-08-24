@@ -140,6 +140,35 @@ std::wstring g_lang = L"auto";       // 语言选择（auto / txt / csharp / ...
 int  g_enc = 0;                      // 当前文档编码：0=UTF-8无BOM 1=UTF-8 BOM 2=UTF-16LE 3=UTF-16BE 4=ANSI(GBK)
 bool g_dirty = false;                // 文档是否已修改（未保存），标题追加 “ *” 提示
 
+// 代码补全（关键字 / 括号配对 / 函数补全）。默认关闭，由 .ini 的 autocomplete 开关控制。
+bool     g_autocomplete  = false;   // 是否开启代码补全（.ini 持久化，默认关闭）
+HWND     g_hComp         = NULL;     // 补全候选列表弹出窗口（懒创建）
+bool     g_compVisible   = false;    // 候选列表是否正在显示
+std::vector<std::wstring> g_compItems;  // 当前候选文本
+std::vector<int>         g_compKind;    // 候选类型：0=关键字/类型 1=函数
+int      g_compSel       = 0;        // 高亮项索引
+int      g_compWordStart = 0;        // 正在补全的词首偏移（替换起点）
+int      g_compWordEnd   = 0;        // 正在补全的词尾偏移（替换终点）
+// 文档内函数名缓存（供“函数补全”使用；文本变化时置脏，下次补全时重建）
+std::vector<std::wstring> g_funcNames;
+bool     g_funcDirty     = true;
+const int COMP_ITEM_H       = 22;    // 候选列表每项高度（像素）
+const int COMP_MAX_VISIBLE = 12;     // 候选列表最多同时显示项数
+const wchar_t* COMP_CLASS  = L"LiteReaderCompWnd_v1";
+static bool g_compClassRegistered = false;
+
+// 代码补全相关前向声明（实现见文件后部的“代码补全”段落）
+void hideCompletion();
+void updateCompletion();
+void rebuildFuncNames();
+void acceptCompletion();
+void showCompletion();
+static bool isPairOpen(wchar_t);
+static bool isPairClose(wchar_t);
+static wchar_t pairClose(wchar_t);
+static LRESULT CALLBACK CompWndProc(HWND,UINT,WPARAM,LPARAM);
+static void registerCompClass();
+
 // 语言枚举
 enum Lang { L_AUTO, L_TXT, L_CS, L_SQL, L_HTML, L_JS, L_JSON, L_PY, L_CSS, L_XML,
             L_C, L_CPP, L_JAVA, L_ASPX };
@@ -214,6 +243,7 @@ void restoreFrom(int i){
   g_visual=d.visual; g_visualCount=d.visualCount;
   g_undoStack=d.undoStack; g_redoStack=d.redoStack;
   invalidateLineCache();   // 切换标签后内容已变，行缓存失效
+  g_funcDirty=true; hideCompletion(); // 切换文档：函数名缓存失效、收起补全列表
 }
 
 // ----------------------------------------------------------------------------
@@ -320,6 +350,7 @@ void loadConfig(){
   if(sb>=SIDEBAR_W_MIN && sb<=SIDEBAR_W_MAX) g_sidebarW=sb;
   wchar_t fb[MAX_PATH];
   if(GetPrivateProfileString(L"Settings",L"folder",L"",fb,MAX_PATH,ip.c_str())) g_cfgFolder=fb;
+  int ac=GetPrivateProfileInt(L"Settings",L"autocomplete",0,ip.c_str()); g_autocomplete=(ac!=0);
 }
 void saveConfig(){
   std::wstring ip=iniPath();
@@ -333,7 +364,7 @@ void saveConfig(){
     }
   }
   auto W=[&](const wchar_t* k, int v){ std::wstring s=std::to_wstring(v); WritePrivateProfileString(L"Settings",k,s.c_str(),ip.c_str()); };
-  W(L"theme",g_themeIdx); W(L"fontsize",g_fontSize);
+  W(L"theme",g_themeIdx); W(L"fontsize",g_fontSize); W(L"autocomplete", g_autocomplete?1:0);
   W(L"x",g_cfgX); W(L"y",g_cfgY); W(L"w",g_cfgW); W(L"h",g_cfgH); W(L"max",g_cfgMax);
   if(g_sidebarW>=SIDEBAR_W_MIN && g_sidebarW<=SIDEBAR_W_MAX) W(L"sidebar",g_sidebarW);
   WritePrivateProfileString(L"Settings",L"folder", g_cfgFolder.empty()?L"":g_cfgFolder.c_str(), ip.c_str());
@@ -503,10 +534,17 @@ inline bool isWordChar(wchar_t c){
 }
 // 给定光标偏移 off，向左右扩展出完整单词边界，写入 [ws,we)
 void wordAtOffset(int off, int& ws, int& we){
-  if(off<0||off>=(int)g_text.size()){ ws=off; we=off; return; }
-  ws=off; we=off+1;
+  int len=(int)g_text.size();
+  if(off<0||off>=len){ ws=off; we=off; return; }
+  ws=off; we=off;
+  // 仅当光标落在单词字符上（词中/词首）才向右扩展；若落在单词“之后”
+  // （词尾、空白、换行），we 保持为 off，避免跨过非单词字符吞掉下一行/下一个词。
+  // 修复：接受补全时把换行符/右括号一起吞掉的问题。
+  if(isWordChar(g_text[off])){
+    we=off+1;
+    while(we<len && isWordChar(g_text[we])) we++;
+  }
   while(ws>0 && isWordChar(g_text[ws-1])) ws--;          // 向左扩展
-  while(we<(int)g_text.size() && isWordChar(g_text[we])) we++; // 向右扩展
 }
 // 收集 g_markWord 的所有“整词”命中区间（前后均非单词字符，避免 in 命中 index 这类子串），
 // 结果写入 g_markRanges 与逐字符标记 g_markFlag（供 paint 直接查表）。
@@ -1983,7 +2021,7 @@ void loadFile(const std::wstring& path){
   std::vector<BYTE> buf(sz);
   DWORD rd=0; ReadFile(h,buf.data(),sz,&rd,NULL); CloseHandle(h);
   g_filePath=path;
-  g_text=decodeBytes(buf);
+  g_text=decodeBytes(buf); g_funcDirty=true;
   g_undoStack.clear(); g_redoStack.clear(); // 载入新文件：撤销/重做历史作废
   g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear(); // 文本变化，清除分词高亮
   g_langId=langFromName();
@@ -2021,6 +2059,7 @@ void applyEdit(int start, int end, const std::wstring& ins, bool record){
   g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
   g_markWord.clear(); g_markFlag.clear(); g_markRanges.clear(); // 文本变化，清除分词高亮
   g_matchA=-1; g_matchB=-1;
+  g_funcDirty=true; // 文本变化，函数名缓存失效
   rebuildLines(); buildVisual(); updateScroll();
   if(g_active>=0 && g_active<(int)g_docs.size()) g_docs[g_active].dirty=true;
   g_dirty=true; updateCaretPos(); InvalidateRect(g_hwnd,NULL,TRUE); setWindowTitle();
@@ -2029,7 +2068,7 @@ void applyEdit(int start, int end, const std::wstring& ins, bool record){
 void undo(){
   if(g_undoStack.empty()) return;
   EditStep s=g_undoStack.back(); g_undoStack.pop_back();
-  g_text.replace(s.start, s.ins.size(), s.del);
+  g_text.replace(s.start, s.ins.size(), s.del); g_funcDirty=true;
   g_redoStack.push_back(s);
   g_caretOff=s.start+(int)s.del.size();
   g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
@@ -2043,7 +2082,7 @@ void undo(){
 void redo(){
   if(g_redoStack.empty()) return;
   EditStep s=g_redoStack.back(); g_redoStack.pop_back();
-  g_text.replace(s.start, s.del.size(), s.ins);
+  g_text.replace(s.start, s.del.size(), s.ins); g_funcDirty=true;
   g_undoStack.push_back(s);
   g_caretOff=s.start+(int)s.ins.size();
   g_selStart=-1; g_selEnd=-1; g_anchorOff=g_caretOff;
@@ -2284,6 +2323,7 @@ void createMenus(){
   AppendMenu(hTheme,MF_STRING,1254,L"极致黑");
   AppendMenu(g_hMenuView,MF_POPUP,(UINT_PTR)hTheme,L"主题");
   AppendMenu(g_hMenuView,MF_STRING,1202,L"自动换行");
+  AppendMenu(g_hMenuView,MF_STRING,1260,L"代码补全");
   AppendMenu(g_hMenuView,MF_STRING,1203,L"字体 +");
   AppendMenu(g_hMenuView,MF_STRING,1204,L"字体 -");
   HMENU hLang=CreatePopupMenu();
@@ -2316,6 +2356,7 @@ void checkMenus(){
   for(int i=0;i<14;i++) CheckMenuItem(hLang,langMap[i],(i==idx)?MF_CHECKED:MF_UNCHECKED);
   for(int i=0;i<NTHEMES;i++) CheckMenuItem(hTheme,1250+i,(i==g_themeIdx)?MF_CHECKED:MF_UNCHECKED);
   CheckMenuItem(g_hMenuView,1202,g_wrap?MF_CHECKED:MF_UNCHECKED); // 自动换行勾选
+  CheckMenuItem(g_hMenuView,1260,g_autocomplete?MF_CHECKED:MF_UNCHECKED); // 代码补全勾选
 }
 
 // ----------------------------------------------------------------------------
@@ -2666,6 +2707,218 @@ void gotoDefinition(const std::wstring& name){
 }
 
 // ----------------------------------------------------------------------------
+// 代码补全：关键字补全 / 括号配对补全 / 函数补全
+//   - 全部受 g_autocomplete 开关控制（.ini 的 autocomplete 项，默认关闭）。
+//   - 关键字/类型补全：依据当前语言关键字表做前缀匹配。
+//   - 函数补全：扫描当前文档内“标识符后紧跟 (”的名称，去重收集。
+//   - 括号配对：输入 ( { [ " ' 时自动补出配对字符并把光标置于中间；
+//     再次输入右配对字符、且其后恰为该字符时，直接跳过（不重复插入）。
+//   - 候选列表为 WS_POPUP 弹出窗口；↑/↓ 选择、Tab/Enter 确认、Esc 取消、点击项确认。
+// ----------------------------------------------------------------------------
+static const std::set<std::wstring>* activeKeywordSet(){
+  switch(g_langId){
+    case L_CS:   return &KW_CS;
+    case L_SQL:  return &KW_SQL;
+    case L_JS:   return &KW_JS;
+    case L_PY:   return &KW_PY;
+    case L_CSS:  return &KW_CSS;
+    case L_C:    return &KW_C;
+    case L_CPP:  return &KW_CPP;
+    case L_JAVA: return &KW_JAVA;
+    default:     return NULL;
+  }
+}
+static const std::set<std::wstring>* activeTypeSet(){
+  switch(g_langId){
+    case L_CS:   return &TY_CS;
+    case L_C:    return &TY_C;
+    case L_CPP:  return &TY_CPP;
+    case L_JAVA: return &TY_JAVA;
+    default:     return NULL;
+  }
+}
+static bool startsWithCI(const std::wstring& s, const std::wstring& p){
+  if(p.empty() || p.size()>s.size()) return false;
+  for(size_t i=0;i<p.size();i++) if(towlower((wchar_t)s[i])!=towlower((wchar_t)p[i])) return false;
+  return true;
+}
+static bool isPairOpen(wchar_t c){ return c==L'('||c==L'{'||c==L'['||c==L'<'||c==L'"'||c==L'\''; }
+static bool isPairClose(wchar_t c){ return c==L')'||c==L'}'||c==L']'||c==L'>'||c==L'"'||c==L'\''; }
+static wchar_t pairClose(wchar_t c){
+  switch(c){ case L'(':return L')'; case L'{':return L'}'; case L'[':return L']'; case L'<':return L'>'; case L'"':return L'"'; case L'\'':return L'\''; }
+  return c;
+}
+// 重建文档内函数名列表（供函数补全）。最多扫描 2MB 以免超大文件卡顿；关键字不作为函数建议。
+void rebuildFuncNames(){
+  g_funcNames.clear(); g_funcDirty=false;
+  int len=(int)g_text.size(); if(len==0) return;
+  int cap=len; if(cap>2*1024*1024) cap=2*1024*1024;
+  const std::set<std::wstring>* kw=activeKeywordSet();
+  std::set<std::wstring> seen;
+  int i=0;
+  while(i<cap){
+    wchar_t c=g_text[i];
+    if(isWordChar(c)){
+      int s=i; while(i<cap && isWordChar(g_text[i])) i++;
+      int e=i;
+      int j=e; while(j<cap && (g_text[j]==L' '||g_text[j]==L'\t'||g_text[j]==L'\n'||g_text[j]==L'\r')) j++;
+      if(j<cap && g_text[j]==L'('){
+        std::wstring name=g_text.substr(s,e-s);
+        if(!(kw && kw->count(name)) && seen.insert(name).second) g_funcNames.push_back(name);
+        if((int)g_funcNames.size()>=2000) break;
+      }
+    } else i++;
+  }
+}
+// 隐藏候选列表并清空候选
+void hideCompletion(){
+  if(g_compVisible){ g_compVisible=false; if(g_hComp) ShowWindow(g_hComp,SW_HIDE); }
+  g_compItems.clear(); g_compKind.clear(); g_compSel=0;
+}
+// 创建/定位/绘制候选列表弹出窗口
+void showCompletion(){
+  if(g_compItems.empty()){ hideCompletion(); return; }
+  int n=(int)g_compItems.size();
+  int vis=(n<COMP_MAX_VISIBLE)?n:COMP_MAX_VISIBLE;
+  // 测量最宽候选以确定弹窗宽度
+  int maxw=0;
+  HDC hdc=GetDC(g_hwnd);
+  HFONT of=(HFONT)SelectObject(hdc, g_hFont?g_hFont:(HFONT)GetStockObject(DEFAULT_GUI_FONT));
+  for(int i=0;i<n;i++){ SIZE sz; GetTextExtentPoint32(hdc,g_compItems[i].c_str(),(int)g_compItems[i].size(),&sz); if(sz.cx>maxw)maxw=sz.cx; }
+  SelectObject(hdc,of); ReleaseDC(g_hwnd,hdc);
+  int pad=6, kindW=26;
+  int w=maxw+pad*2+kindW+8; if(w<160)w=160; if(w>360)w=360;
+  int h=vis*COMP_ITEM_H+2;
+  // 弹窗定位在光标下方（屏幕坐标）
+  POINT cp; GetCaretPos(&cp); ClientToScreen(g_hwnd,&cp);
+  int x=cp.x, y=cp.y+g_lineH+1;
+  int sh=GetSystemMetrics(SM_CYSCREEN);
+  if(y+h>sh) y=cp.y-h-1; if(y<0) y=0;
+  if(!g_hComp){
+    if(!g_compClassRegistered){ registerCompClass(); g_compClassRegistered=true; }
+    g_hComp=CreateWindowEx(WS_EX_TOPMOST|WS_EX_NOACTIVATE, COMP_CLASS, NULL,
+      WS_POPUP|WS_BORDER, x,y,w,h, g_hwnd, NULL, g_hInst, NULL);
+    if(!g_hComp){ g_compVisible=false; return; }
+  } else {
+    SetWindowPos(g_hComp,NULL,x,y,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
+  }
+  g_compVisible=true;
+  ShowWindow(g_hComp,SW_SHOWNOACTIVATE);
+  RedrawWindow(g_hComp,NULL,NULL,RDW_INVALIDATE|RDW_UPDATENOW);
+}
+// 确认当前高亮候选，用其替换正在输入的词（函数补全会自动补出 ()）
+void acceptCompletion(){
+  if(!g_compVisible) return;
+  if(g_compSel<0||g_compSel>=(int)g_compItems.size()){ hideCompletion(); return; }
+  std::wstring full=g_compItems[g_compSel];
+  int isFn=(g_compKind[g_compSel]==1);
+  int ws=g_compWordStart, we=g_compWordEnd;
+  wchar_t nxt = (we<(int)g_text.size()) ? g_text[we] : 0;
+  if(isFn && nxt!=L'(' && nxt!=L')'){
+    // 常规情况：函数名后无现成括号，补出 ()
+    std::wstring ins=full+L"()";
+    applyEdit(ws,we,ins,true);
+    g_caretOff=ws+(int)full.size()+1; // 光标置于 () 之间
+    updateCaretPos();
+  } else if(isFn){
+    // 函数名后已紧跟 ( 或 )：仅替换名称，光标进入 () 内（不动输入焦点到词中）
+    applyEdit(ws,we,full,true);
+    g_caretOff=we;
+    if(g_caretOff+1<(int)g_text.size() && g_text[g_caretOff]==L'(' && g_text[g_caretOff+1]==L')') g_caretOff++;
+    else if(g_caretOff<(int)g_text.size() && g_text[g_caretOff]==L'(') g_caretOff++;
+  } else {
+    // 关键字/类型：补全整词后追加一个空格，光标落在空格之后，
+    // 避免在补全词内部停留（修复：补全后焦点停在输入前的位置）
+    applyEdit(ws,we,full+L" ",true);
+  }
+  hideCompletion();
+}
+// 根据光标处正在输入的词，收集关键字/函数候选并刷新弹窗
+void updateCompletion(){
+  if(!g_autocomplete){ hideCompletion(); return; }
+  int ws,we; wordAtOffset(g_caretOff, ws, we);
+  std::wstring prefix=g_text.substr(ws, g_caretOff-ws);
+  if(prefix.empty()){ hideCompletion(); return; }
+  std::vector<std::wstring> items; std::vector<int> kinds;
+  const std::set<std::wstring>* kw=activeKeywordSet();
+  const std::set<std::wstring>* ty=activeTypeSet();
+  auto addSet=[&](const std::set<std::wstring>* s, int kind){
+    if(!s) return;
+    for(const std::wstring& nm : *s){ if(startsWithCI(nm,prefix)){ items.push_back(nm); kinds.push_back(kind); } }
+  };
+  addSet(kw,0); addSet(ty,0);
+  if(g_funcDirty) rebuildFuncNames();
+  for(const std::wstring& nm : g_funcNames){ if(startsWithCI(nm,prefix)){ items.push_back(nm); kinds.push_back(1); } }
+  if(items.empty()){ hideCompletion(); return; }
+  // 去重（保留首次出现），并限制总数
+  std::vector<std::wstring> nitems; std::vector<int> nkinds; std::set<std::wstring> dup;
+  for(size_t i=0;i<items.size();i++){
+    if(dup.insert(items[i]).second){ nitems.push_back(items[i]); nkinds.push_back(kinds[i]); }
+  }
+  const int MAXC=600;
+  if((int)nitems.size()>MAXC){ nitems.resize(MAXC); nkinds.resize(MAXC); }
+  g_compItems.swap(nitems); g_compKind.swap(nkinds);
+  g_compWordStart=ws; g_compWordEnd=we; g_compSel=0;
+  showCompletion();
+}
+// 候选列表弹出窗口过程（自绘，仅显示/选择用）
+LRESULT CALLBACK CompWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp){
+  if(msg==WM_PAINT){
+    PAINTSTRUCT ps; HDC hdc=BeginPaint(hw,&ps);
+    RECT rc; GetClientRect(hw,&rc);
+    HBRUSH bg=CreateSolidBrush(TH.bg); FillRect(hdc,&rc,bg); DeleteObject(bg);
+    HPEN pen=CreatePen(PS_SOLID,1,TH.menuBarDivider); HPEN op=(HPEN)SelectObject(hdc,pen);
+    MoveToEx(hdc,0,0,NULL); LineTo(hdc,rc.right,0);
+    MoveToEx(hdc,0,rc.bottom-1,NULL); LineTo(hdc,rc.right,rc.bottom-1);
+    MoveToEx(hdc,0,0,NULL); LineTo(hdc,0,rc.bottom);
+    MoveToEx(hdc,rc.right-1,0,NULL); LineTo(hdc,rc.right-1,rc.bottom);
+    SelectObject(hdc,op); DeleteObject(pen);
+    HFONT f=g_hFont?g_hFont:(HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT of=(HFONT)SelectObject(hdc,f);
+    SetBkMode(hdc,TRANSPARENT);
+    std::wstring prefix=g_text.substr(g_compWordStart, g_caretOff-g_compWordStart);
+    int pad=6, ty=(COMP_ITEM_H-g_lineH)/2; if(ty<0)ty=0;
+    for(int i=0;i<(int)g_compItems.size();i++){
+      int y=i*COMP_ITEM_H;
+      RECT ir={1,y,rc.right-1,y+COMP_ITEM_H};
+      if(i==g_compSel){ HBRUSH hb=CreateSolidBrush(TH.selBg); FillRect(hdc,&ir,hb); DeleteObject(hb); }
+      const std::wstring& s=g_compItems[i];
+      int pre=(int)prefix.size(); if(pre>(int)s.size()) pre=(int)s.size(); // 前缀不超过候选长度，避免越界
+      bool isFn=(g_compKind[i]==1);
+      SetTextColor(hdc, isFn?TH.c[T_FUNC]:TH.c[T_KEYWORD]);   // 已输入前缀高亮（函数/关键字色）
+      SIZE sz1; GetTextExtentPoint32(hdc,s.c_str(),pre,&sz1);
+      TextOut(hdc,pad,y+ty,s.c_str(),pre);
+      SetTextColor(hdc,TH.c[T_TEXT]);                      // 其余部分普通色
+      int rest=(int)s.size()-pre; if(rest<0)rest=0;
+      TextOut(hdc,pad+sz1.cx,y+ty,s.c_str()+pre,rest);
+      const wchar_t* tag=isFn?L"fn":L"kw";            // 右侧类别标签
+      SIZE sz2; GetTextExtentPoint32(hdc,tag,(int)wcslen(tag),&sz2);
+      SetTextColor(hdc, TH.menuBarDivider);
+      TextOut(hdc, rc.right-pad-sz2.cx, y+ty, tag, (int)wcslen(tag));
+    }
+    SelectObject(hdc,of);
+    EndPaint(hw,&ps);
+    return 0;
+  }
+  if(msg==WM_LBUTTONDOWN){
+    int y=(int)(short)HIWORD(lp);
+    int idx=y/COMP_ITEM_H;
+    if(idx>=0 && idx<(int)g_compItems.size()){ g_compSel=idx; acceptCompletion(); }
+    return 0;
+  }
+  return DefWindowProc(hw,msg,wp,lp);
+}
+void registerCompClass(){
+  WNDCLASSEX wc={sizeof(wc)};
+  wc.style=CS_SAVEBITS;
+  wc.lpfnWndProc=CompWndProc;
+  wc.hInstance=g_hInst;
+  wc.hbrBackground=CreateSolidBrush(TH.bg);
+  wc.lpszClassName=COMP_CLASS;
+  RegisterClassEx(&wc);
+}
+
+// ----------------------------------------------------------------------------
 // 主窗口过程
 // 处理所有窗口消息：创建、绘制、滚动、鼠标、键盘、菜单、命令、销毁等。
 // ----------------------------------------------------------------------------
@@ -2687,6 +2940,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0;
     }
     case WM_SIZE:{
+      hideCompletion();   // 窗口尺寸变化，收起补全列表
       ensureFont();
       if(g_wrap){ buildVisual(); invalidateLineCache(); } // 换行模式视觉行随宽度变化需重建+失效缓存；非换行视觉行与宽度无关
       updateScroll();
@@ -2699,6 +2953,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0;
     }
     case WM_VSCROLL:{
+      hideCompletion();   // 垂直滚动，收起补全列表
       int pos=GetScrollPos(hwnd,SB_VERT);
       RECT r; GetClientRect(hwnd,&r); int page=(r.bottom-editorTop())/g_lineH;
       int m=LOWORD(wp);
@@ -2711,6 +2966,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0;
     }
     case WM_HSCROLL:{
+      hideCompletion();   // 水平滚动，收起补全列表
       int pos=GetScrollPos(hwnd,SB_HORZ);
       int m=LOWORD(wp);
       if(m==SB_LINELEFT)pos-=g_charW*4; else if(m==SB_LINERIGHT)pos+=g_charW*4;
@@ -2742,6 +2998,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0; // 侧栏等其它区域不弹出菜单
     }
     case WM_MOUSEWHEEL:{
+      hideCompletion();   // 滚轮滚动，收起补全列表
       int sx=(int)(short)LOWORD(lp), sy=(int)(short)HIWORD(lp);
       POINT pt={sx,sy}; ScreenToClient(hwnd,&pt);
       // Ctrl+滚轮：调整字号（每格 ±1pt，范围 9~28）
@@ -2787,8 +3044,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT: paint(); return 0;
     case WM_ERASEBKGND: return 1; // 由 paint 自己画背景，禁止系统擦除（避免闪烁）
     case WM_SETFOCUS: updateCaretPos(); return 0;
-    case WM_KILLFOCUS: DestroyCaret(); return 0;
+    case WM_KILLFOCUS: hideCompletion(); DestroyCaret(); return 0;
     case WM_LBUTTONDOWN:{
+      hideCompletion();   // 点击编辑区，收起补全列表
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
       // 顶部自绘菜单栏
       if(y<MENU_H){
@@ -3033,6 +3291,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         else if(wp=='Y'){ redo(); return 0; }                       // Ctrl+Y 重做
         else if(wp==VK_TAB){ int n=(int)g_docs.size(); if(n>1){ int nx= shift? (g_active-1+n)%n : (g_active+1)%n; switchTab(nx); } return 0; }
       }
+      // 代码补全候选列表导航（开启且可见时，拦截 ↑/↓/Tab/Enter/Esc；其余键先收起，输入键会在 WM_CHAR 重新触发）
+      if(g_compVisible && !ctrl && !alt){
+        if(wp==VK_DOWN){ g_compSel++; if(g_compSel>=(int)g_compItems.size())g_compSel=0; RedrawWindow(g_hComp,NULL,NULL,RDW_INVALIDATE|RDW_UPDATENOW); return 0; }
+        if(wp==VK_UP){ g_compSel--; if(g_compSel<0)g_compSel=(int)g_compItems.size()-1; RedrawWindow(g_hComp,NULL,NULL,RDW_INVALIDATE|RDW_UPDATENOW); return 0; }
+        if(wp==VK_TAB||wp==VK_RETURN){ acceptCompletion(); return 0; }
+        if(wp==VK_ESCAPE){ hideCompletion(); return 0; }
+        hideCompletion(); // 其余按键（方向/Home/End/普通字符等）先收起，避免陈旧列表
+      }
       // 方向键/Home/End/PageUp/PageDown 移动光标（保持列号，遇短行则夹取）
       int line=lineOfOffset(g_caretOff);
       int col=g_caretOff-g_lineStart[line];
@@ -3065,8 +3331,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         case VK_F3: doFind(true); return 0; // F3 重复上次查找
         case VK_F12: gotoDefinition(selectedOrWordAtCaret()); return 0; // 跳转到定义
         // 轻量编辑：退格/删除/回车/制表符（均作用于编辑器文本，交给编辑函数处理并保持光标）
-        case VK_BACK:   deleteChar(false); return 0;
-        case VK_DELETE: deleteChar(true);  return 0;
+        case VK_BACK:   deleteChar(false); if(g_autocomplete) updateCompletion(); return 0;
+        case VK_DELETE: deleteChar(true);  if(g_autocomplete) updateCompletion(); return 0;
         case VK_RETURN: insertText(L"\n");  return 0;
         case VK_TAB:    insertText(L"\t");  return 0;
         default: return DefWindowProc(hwnd,msg,wp,lp); // 其它按键交还系统
@@ -3092,10 +3358,33 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_CHAR:{
       wchar_t ch=(wchar_t)wp;
-      if(ch==0x7F){ deleteChar(true); return 0; }   // DEL
+      if(ch==0x7F){ deleteChar(true); if(g_autocomplete) updateCompletion(); return 0; } // DEL
       if(ch<0x20) return 0;                          // 控制字符（回车/退格/Tab 已在 WM_KEYDOWN 处理）
       if(g_hFind && GetFocus()==g_hFind) return DefWindowProc(hwnd,msg,wp,lp); // 焦点在查找框时不当作编辑器输入
+      // 代码补全：括号/引号自动配对（开启时）
+      if(g_autocomplete){
+        // 尖括号仅在“前面紧跟标识符”的模板/泛型语境下自动配对（如 Vector<），
+        // 避免 a < b 这类比较运算被误配对；其余配对字符（(){}[]""''）正常处理。
+        bool pair = isPairOpen(ch) && !(ch==L'<' && !(g_caretOff>0 && isWordChar(g_text[g_caretOff-1])));
+        if(pair){
+          wchar_t close=pairClose(ch);
+          if(g_selStart>=0){ // 选中区域：用配对字符包裹
+            std::wstring sel=g_text.substr(g_selStart,g_selEnd-g_selStart);
+            applyEdit(g_selStart,g_selEnd, std::wstring(1,ch)+sel+std::wstring(1,close), true);
+          } else {
+            insertText(std::wstring(1,ch)+std::wstring(1,close)); // 成对插入
+            g_caretOff--; updateCaretPos();                       // 光标置于配对中间
+          }
+          updateCompletion();
+          return 0;
+        }
+        // 右配对字符：若其后恰为该字符，则跳过而非重复插入
+        if(isPairClose(ch) && g_caretOff<(int)g_text.size() && g_text[g_caretOff]==ch){
+          g_caretOff++; updateCaretPos(); updateCompletion(); return 0;
+        }
+      }
       insertText(std::wstring(1,ch));                // 普通字符：插入到光标处
+      if(g_autocomplete) updateCompletion();         // 触发关键字/函数补全
       return 0;
     }
     case WM_COMMAND:{
@@ -3140,6 +3429,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(g_active>=0) g_docs[g_active].lang=g_lang, g_docs[g_active].langId=g_langId;
         InvalidateRect(hwnd,NULL,TRUE); setWindowTitle();
       }
+      else if(id==1260){ g_autocomplete=!g_autocomplete; saveConfig(); checkMenus(); } // 代码补全开关（持久化到 .ini）
+      hideCompletion();   // 任意菜单命令后收起补全列表
       return 0;
     }
     case WM_CLOSE: saveConfig(); DestroyWindow(hwnd); return 0;
