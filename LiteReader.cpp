@@ -28,6 +28,7 @@ const int TAB_W_MIN = 120; // 单个标签最小宽度（像素）
 const int TAB_W_MAX = 320; // 单个标签最大宽度（像素），超过则末尾省略号兜底
 const int TAB_CLOSE_W = 18;// 标签内关闭按钮宽度（像素）
 const int TAB_PAD    = 12; // 标签文字左右内边距合计（左6 + 右6），用于动态宽度估算
+const int MENU_H     = 24; // 顶部自绘菜单栏高度（像素）
 
 // 左侧文件夹浏览器（VSCode 风格）布局常量
 const int SIDEBAR_W      = 240; // 侧栏默认宽度（像素）；未打开文件夹时为 0
@@ -55,6 +56,14 @@ const int FIND_H = 30;                // 查找条高度（像素）
 RECT     g_rPrev={0}, g_rNext={0}, g_rClose={0}; // 三个按钮的命中矩形
 int      g_findHover = 0;             // 当前鼠标悬停的按钮：0=无 1=上一项 2=下一项 3=关闭
 int      g_findPress = 0;             // 当前按下的按钮（同上枚举），用于按下态绘制
+
+// 自绘顶部菜单栏（替代系统菜单条，以解决 Windows 10 经典菜单条无法随主题变色的问题）
+HMENU    g_hMenuFile = NULL;          // 文件弹出菜单
+HMENU    g_hMenuEdit = NULL;          // 编辑弹出菜单
+HMENU    g_hMenuView = NULL;          // 视图弹出菜单
+int      g_menuHover = -1;            // 当前悬停的菜单项索引：-1=无
+int      g_menuActive = -1;           // 当前点下/展开的菜单项索引
+RECT     g_menuRects[3];              // 三个菜单项的命中矩形
 
 // 双击分词高亮：g_markWord 为当前标记词，g_markFlag 逐字符标记命中，g_markRanges 为所有命中区间
 std::wstring g_markWord;
@@ -225,6 +234,7 @@ struct Theme {
   COLORREF tabStripBg, tabDivider, tabBg, tabBgActive, tabAccent, tabText, tabTextActive, plusBg, plusText;
   COLORREF findBg, findDivider, findIcon, findBtnBg, findBtnBgHover, findBtnBgPress, findBtnText, findCloseBg, findCloseHover;
   COLORREF border, caption, captionText; // 窗口边框 / 标题栏 / 标题文字颜色（随主题）
+  COLORREF menuBarBg, menuBarDivider, menuBarText, menuBarTextHover, menuBarHover;
 };
 Theme g_themes[NTHEMES] = {
   // 0 One Dark Pro（原默认深色）
@@ -234,7 +244,9 @@ Theme g_themes[NTHEMES] = {
     0x00342C28,0x002B2521,0x0070635C,0x0051443E,0x00525220,0x0046401A,0x00FFFFFF,0x00FFFFFF,0x00333333,
     0x002B2521,0x001F1B18,0x009DA5B4,0x00888888,0x00FFFFFF,0x007BC0E5,0x00714709,0x002A2D2E,0x00545454,0x00000000,0x00666666,
     0x00252526,0x003A3A3A,0x002D2D2D,0x001E1E1E,0x00569CD6,0x00C0C0C0,0x00FFFFFF,0x002D2D2D,0x00FFFFFF,
-    0x002B2521,0x003A3A3A,0x009DA5B4,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x003A3A3A,0x008A3B3B, 0x00252526,0x00252526,0x00D4D4D4 },
+    0x002B2521,0x003A3A3A,0x009DA5B4,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x003A3A3A,0x008A3B3B,
+    0x00252526,0x00252526,0x00D4D4D4,
+    0x00252526,0x003A3A3A,0x00D4D4D4,0x00FFFFFF,0x003A3A3A },
   // 1 One Light（原默认浅色）
   { L"One Light", false,
     { 0x002E2924,0x00A426A6,0x00016898,0x004AA150,0x00998F8B,0x00164BCB,0x005B18C2,0x00016898,0x004AA150,0x002E2924,0x006A6057,0x00000000,0x00F27840,0x00164BCB,0x00BC8401 },
@@ -242,7 +254,9 @@ Theme g_themes[NTHEMES] = {
     0x00FAFAFA,0x00F0F0F0,0x00999999,0x00FFE8CF,0x00A0F3FF,0x00BFE6C0,0x00000000,0x00000000,0x00E1E4E8,
     0x00F3F3F3,0x00ECECEC,0x00444444,0x00999999,0x00000000,0x002D7DD2,0x00D2E7FF,0x00E6E6E6,0x00BFBFBF,0x00DADADA,0x00999999,
     0x00F0F0F0,0x00D0D0D0,0x00E4E4E4,0x00FFFFFF,0x001976D2,0x00555555,0x00000000,0x00E4E4E4,0x00000000,
-    0x00F3F3F3,0x00D0D0D0,0x00555555,0x002F7FD1,0x004A95DD,0x001F5FA0,0x00FFFFFF,0x00D0D0D0,0x00C0392B, 0x00D0D0D0,0x00F3F3F3,0x00000000 },
+    0x00F3F3F3,0x00D0D0D0,0x00555555,0x002F7FD1,0x004A95DD,0x001F5FA0,0x00FFFFFF,0x00D0D0D0,0x00C0392B,
+    0x00D0D0D0,0x00F3F3F3,0x00000000,
+    0x00F3F3F3,0x00D0D0D0,0x00000000,0x00000000,0x00E4E4E4 },
   // 2 VS Code Dark+（仿 VS Code 原生深色）
   { L"VS Code", true,
     { 0x00D4D4D4,0x00D69C56,0x00B0C94E,0x007891CE,0x0055996A,0x00A8CEB5,0x00D69C56,0x00FEDC9C,0x007891CE,0x00D4D4D4,0x00D4D4D4,0x00000000,0x00AADCDC,0x00AADCDC,0x00C0C686 },
@@ -250,7 +264,9 @@ Theme g_themes[NTHEMES] = {
     0x001E1E1E,0x001E1E1E,0x00858585,0x00784F26,0x003D3737,0x0032323A,0x00FFFFFF,0x00FFFFFF,0x00202020,
     0x00262526,0x00333333,0x00CCCCCC,0x00999999,0x00FFFFFF,0x00C5C5C5,0x003D3737,0x002A2D2E,0x00424242,0x00202020,0x00888888,
     0x00252526,0x00202020,0x002D2D2D,0x001E1E1E,0x00CC7A00,0x00969696,0x00FFFFFF,0x002D2D2D,0x00FFFFFF,
-    0x00262526,0x00202020,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B, 0x00252526,0x00333333,0x00D4D4D4 },
+    0x00262526,0x00202020,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B,
+    0x00252526,0x00333333,0x00D4D4D4,
+    0x00252526,0x00202020,0x00CCCCCC,0x00FFFFFF,0x00333333 },
   // 3 IntelliJ IDEA（仿 IDEA 原生 Darcula 深色）
   { L"IntelliJ IDEA", true,
     { 0x00C6B7A9,0x003278CC,0x006DC6FF,0x0059876A,0x00808080,0x00BB9768,0x003278CC,0x00BABABA,0x0059876A,0x00C6B7A9,0x00C6B7A9,0x00000000,0x006DC6FF,0x006DC6FF,0x003278CC },
@@ -258,7 +274,9 @@ Theme g_themes[NTHEMES] = {
     0x002B2B2B,0x00353331,0x00909090,0x00834221,0x00714909,0x004A4946,0x00FFFFFF,0x00FFFFFF,0x00353536,
     0x00353331,0x00353331,0x00A9B7C6,0x00888888,0x00FFFFFF,0x00A9B7C6,0x00302F2D,0x0036383A,0x005A5D5E,0x00262627,0x00888888,
     0x00413F3C,0x00262627,0x0047474A,0x002B2B2B,0x003278CC,0x00A8B0BC,0x00FFFFFF,0x0047474A,0x00FFFFFF,
-    0x00353331,0x00262627,0x00A9B7C6,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B, 0x0047474A,0x0047474A,0x00A8B0BC },
+    0x00353331,0x00262627,0x00A9B7C6,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00333333,0x008A3B3B,
+    0x0047474A,0x0047474A,0x00A8B0BC,
+    0x0047474A,0x00262627,0x00A8B0BC,0x00FFFFFF,0x0036383A },
   // 4 极致黑（纯黑背景高对比）
   { L"极致黑", true,
     { 0x00FFFFFF,0x00FFC14F,0x00B0C94E,0x007891CE,0x0055996A,0x00A8CEB5,0x00FFC14F,0x00FEDC9C,0x007891CE,0x00FFFFFF,0x00E0E0E0,0x00000000,0x00AADCDC,0x00AADCDC,0x00C0C686 },
@@ -266,7 +284,9 @@ Theme g_themes[NTHEMES] = {
     0x00000000,0x00050505,0x00666666,0x00784F26,0x003A3A3A,0x002A2A2A,0x00FFFFFF,0x00FFFFFF,0x00222222,
     0x00050505,0x000A0A0A,0x00CCCCCC,0x00888888,0x00FFFFFF,0x00FFC080,0x00141414,0x00101010,0x00333333,0x00181818,0x00888888,
     0x00000000,0x00222222,0x00141414,0x00000000,0x00FFC14F,0x00CCCCCC,0x00FFFFFF,0x00141414,0x00FFFFFF,
-    0x00050505,0x00181818,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00181818,0x008A3B3B, 0x00222222,0x00050505,0x00FFFFFF },
+    0x00050505,0x00181818,0x00CCCCCC,0x003A6EA5,0x004A82BE,0x002A5278,0x00FFFFFF,0x00181818,0x008A3B3B,
+    0x00222222,0x00050505,0x00FFFFFF,
+    0x00050505,0x00222222,0x00CCCCCC,0x00FFFFFF,0x00141414 },
 };
 #define TH (g_themes[g_themeIdx])
 
@@ -337,6 +357,9 @@ void setTheme(int i){
 #ifndef DWMWA_TEXT_COLOR
 #define DWMWA_TEXT_COLOR 36
 #endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20   // Win11 SDK 编号；Win10(20H1+) 用 19，下方会回退
+#endif
 void applyThemeToFrame(){
   if(!g_hwnd) return;
   HMODULE h=LoadLibraryW(L"dwmapi.dll"); if(!h) return;
@@ -344,10 +367,18 @@ void applyThemeToFrame(){
   DswSetAttr fn=(DswSetAttr)GetProcAddress(h,"DwmSetWindowAttribute");
   if(fn){
     COLORREF b=TH.border, c=TH.caption, t=TH.captionText;
-    fn(g_hwnd,DWMWA_BORDER_COLOR,&b,sizeof(b));   // 窗口边框（1px 外框）
-    fn(g_hwnd,DWMWA_CAPTION_COLOR,&c,sizeof(c));  // 标题栏背景
-    fn(g_hwnd,DWMWA_TEXT_COLOR,&t,sizeof(t));     // 标题文字
-    // 强制重绘非客户区，使新边框/标题栏色立即生效
+    fn(g_hwnd,DWMWA_BORDER_COLOR,&b,sizeof(b));   // 窗口边框（1px 外框，Win11）
+    fn(g_hwnd,DWMWA_CAPTION_COLOR,&c,sizeof(c));  // 标题栏背景（Win11）
+    fn(g_hwnd,DWMWA_TEXT_COLOR,&t,sizeof(t));     // 标题文字（Win11）
+    // 沉浸式深色模式：让整个非客户区（标题栏、菜单栏、边框）随主题深浅切换。
+    // 这是 Win10(20H1+) 与 Win11 都能稳定着色【菜单栏】与【边框】的唯一可靠方式 —
+    // 34/35/36 仅 Win11 且仅覆盖标题栏与边框，不包含菜单栏。
+    BOOL dm = TH.dark ? TRUE : FALSE;
+    if(fn(g_hwnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&dm,sizeof(dm))!=S_OK){
+      DWORD a19=19;                              // 旧系统（Win10 早期）该属性编号为 19
+      fn(g_hwnd,a19,&dm,sizeof(dm));
+    }
+    // 强制重绘非客户区，使新边框/标题栏/菜单栏色立即生效
     RedrawWindow(g_hwnd,NULL,NULL,RDW_FRAME|RDW_INVALIDATE|RDW_UPDATENOW);
   }
   FreeLibrary(h);
@@ -369,6 +400,10 @@ std::wstring openFileDialog();
 void openInNewTab(const std::wstring& path);
 void switchTab(int j);
 void closeTab(int i);
+void createMenus();                  // 创建顶部自绘菜单栏使用的弹出菜单
+void drawMenuBar(HDC mem, const RECT& rc); // 自绘菜单栏（文件/编辑/视图）
+int menuBarHit(int x, const RECT& rc);     // 返回 0=文件 1=编辑 2=视图，-1=无
+void showMenuPopup(int idx, HWND hwnd, const RECT& rc); // 展开某一项弹出菜单
 
 // 二分查找：给定字符偏移 off，返回它属于第几行
 // g_lineStart 是单调递增的，所以用二分；结果 res 为最后一个 <= off 的行。
@@ -460,7 +495,7 @@ void bringToFront(HWND hw){
 // 查找条 / 分词高亮：辅助函数
 // ----------------------------------------------------------------------------
 // 编辑器可视区顶部 y：显示查找条时整体下移 FIND_H，避免首行被查找条遮挡。
-int editorTop(){ return TAB_H + (g_hFind?FIND_H:0); }
+int editorTop(){ return MENU_H + TAB_H + (g_hFind?FIND_H:0); }
 
 // 判断字符是否构成“单词”（标识符）的一部分：字母/数字/下划线/美元符/Python 的 @
 inline bool isWordChar(wchar_t c){
@@ -1363,9 +1398,9 @@ void drawSidebar(HDC mem, const RECT& rc){
   HGDIOBJ oldSideFnt=SelectObject(mem,g_sideFont); // 侧栏用独立字体，不受编辑器字号影响
   int lb=leftBar();
   int eTop=editorTop();
-  // 背景（从标签栏下沿 TAB_H 起，覆盖查找条左侧的留白带，避免缝隙）
+  // 背景（从菜单栏+标签栏下沿起，覆盖查找条左侧的留白带，避免缝隙）
   COLORREF sbBg = TH.sbBg;
-  RECT sbrc={0,TAB_H,lb,rc.bottom};
+  RECT sbrc={0,MENU_H+TAB_H,lb,rc.bottom};
   HBRUSH bb=CreateSolidBrush(sbBg); FillRect(mem,&sbrc,bb); DeleteObject(bb);
   // 头部
   RECT hdr={0,eTop,lb,eTop+SIDEBAR_HEAD_H};
@@ -1417,7 +1452,7 @@ void drawSidebar(HDC mem, const RECT& rc){
   }
   // 分隔线（侧栏与编辑器之间）
   HPEN sp=CreatePen(PS_SOLID,1,TH.sbDivider); HPEN op=(HPEN)SelectObject(mem,sp);
-  MoveToEx(mem,lb,TAB_H,NULL); LineTo(mem,lb,rc.bottom); SelectObject(mem,op); DeleteObject(sp);
+  MoveToEx(mem,lb,MENU_H+TAB_H,NULL); LineTo(mem,lb,rc.bottom); SelectObject(mem,op); DeleteObject(sp);
   // 树滚动条滑块
   int viewH=rc.bottom-sbTop; int contentH=(int)g_treeRows.size()*SIDEBAR_ROW_H;
   if(contentH>viewH){
@@ -1469,41 +1504,42 @@ void ensureActiveTabVisible(){
   clampTabScroll();
 }
 
-// 绘制顶部标签栏（各文档标签按名称动态宽度 + 新建按钮钉在最右），覆盖在最上方一行。
+// 绘制顶部标签栏（各文档标签按名称动态宽度 + 新建按钮钉在最右），位于菜单栏下方。
 void drawTabBar(HDC mem, const RECT& rc){
   clampTabScroll(); // 窗口变宽后把标签滚回可视区，避免标签“卡”在滚动偏移处
   COLORREF stripBg = TH.tabStripBg;
   HBRUSH sb=CreateSolidBrush(stripBg); FillRect(mem,&rc,sb); DeleteObject(sb);
+  int top=rc.top; int bot=rc.bottom;
   // 标签栏底部分隔线（贯穿到加号按钮左侧）
   int stripRight=rc.right-PLUS_W; if(stripRight<0)stripRight=0;
   HPEN bp=CreatePen(PS_SOLID,1,TH.tabDivider); HPEN op=(HPEN)SelectObject(mem,bp);
-  MoveToEx(mem,0,TAB_H-1,NULL); LineTo(mem,stripRight,TAB_H-1); SelectObject(mem,op); DeleteObject(bp);
+  MoveToEx(mem,0,bot-1,NULL); LineTo(mem,stripRight,bot-1); SelectObject(mem,op); DeleteObject(bp);
 
   int n=(int)g_docs.size();
   // 裁剪到“标签条带”区域（加号按钮左侧），被滚出左侧的标签不绘制
   int saved=SaveDC(mem);
-  IntersectClipRect(mem,0,0,stripRight,TAB_H);
+  IntersectClipRect(mem,0,top,stripRight,bot);
   SetBkMode(mem,TRANSPARENT);
   int cx=TAB_X0 - g_tabScroll;
   for(int i=0;i<n;i++){
     int w=tabWidthFor(i);
     if(cx+w<=0){ cx+=w; continue; }   // 完全在可视区左侧外，跳过
     if(cx>=stripRight) break;          // 已超出条带右界，后续不再可见
-    RECT tr={cx,0,cx+w,TAB_H};
+    RECT tr={cx,top,cx+w,bot};
     bool act=(i==g_active);
     COLORREF tb = act? TH.tabBgActive : TH.tabBg; // 激活标签背景更亮
     HBRUSH tbk=CreateSolidBrush(tb); FillRect(mem,&tr,tbk); DeleteObject(tbk);
     if(act){
       // 激活标签底部画一条强调色横线
       HPEN ap=CreatePen(PS_SOLID,2,TH.tabAccent); HPEN ao=(HPEN)SelectObject(mem,ap);
-      MoveToEx(mem,cx,TAB_H-1,NULL); LineTo(mem,cx+w,TAB_H-1); SelectObject(mem,ao); DeleteObject(ap);
+      MoveToEx(mem,cx,bot-1,NULL); LineTo(mem,cx+w,bot-1); SelectObject(mem,ao); DeleteObject(ap);
     }
     std::wstring t=tabTitle(i);
-    RECT tr2={cx+6,0,cx+w-TAB_CLOSE_W-6,TAB_H};
+    RECT tr2={cx+6,top,cx+w-TAB_CLOSE_W-6,bot};
     SetTextColor(mem, act? TH.tabTextActive : TH.tabText);
     DrawText(mem,t.c_str(),(int)t.size(),&tr2,DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     // 关闭按钮 ×
-    RECT cr={cx+w-TAB_CLOSE_W,4,cx+w-4,TAB_H-4};
+    RECT cr={cx+w-TAB_CLOSE_W,top+4,cx+w-4,bot-4};
     SetTextColor(mem, TH.tabText);
     DrawText(mem,L"×",1,&cr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
     cx+=w;
@@ -1511,7 +1547,7 @@ void drawTabBar(HDC mem, const RECT& rc){
   RestoreDC(mem,saved);
 
   // “新建标签”按钮（+）钉在最右侧，始终可见
-  RECT pr={rc.right-PLUS_W,2,rc.right-2,TAB_H-2};
+  RECT pr={rc.right-PLUS_W,top+2,rc.right-2,bot-2};
   HBRUSH pb=CreateSolidBrush(TH.plusBg); FillRect(mem,&pr,pb); DeleteObject(pb);
   SetBkMode(mem,TRANSPARENT); SetTextColor(mem, TH.plusText);
   DrawText(mem,L"+",1,&pr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
@@ -1777,7 +1813,7 @@ static void scrollByLines(int delta){
 }
 // 查找条绘制（从 paint 中抽取，便于按更新矩形局部重绘）
 static void drawFindBar(HDC mem, RECT rc){
-  int by=TAB_H, bh=FIND_H;
+  int by=rc.top, bh=rc.bottom-rc.top;
   RECT fbr={leftBar(),by,rc.right,by+bh};
   COLORREF fb = TH.findBg;
   HBRUSH fbk=CreateSolidBrush(fb); FillRect(mem,&fbr,fbk); DeleteObject(fbk);
@@ -1850,11 +1886,13 @@ void paint(){
 
   // 查找条（仅当更新矩形与之相交时重绘）
   if(g_hFind){
-    RECT fbrc={leftBar(),TAB_H,rc.right,TAB_H+FIND_H};
+    RECT fbrc={leftBar(),MENU_H+TAB_H,rc.right,MENU_H+TAB_H+FIND_H};
     if(rectsIntersect(ur,fbrc)) drawFindBar(mem,fbrc);
   }
   // 标签栏（仅当更新矩形与之相交时重绘）
-  { RECT tbrc={0,0,rc.right,TAB_H}; if(rectsIntersect(ur,tbrc)) drawTabBar(mem,tbrc); }
+  { RECT tbrc={0,MENU_H,rc.right,MENU_H+TAB_H}; if(rectsIntersect(ur,tbrc)) drawTabBar(mem,tbrc); }
+  // 顶部自绘菜单栏（必须最后画，覆盖任何可能从上方泄漏的背景）
+  { RECT mbrc={0,0,rc.right,MENU_H}; if(rectsIntersect(ur,mbrc)) drawMenuBar(mem,mbrc); }
   // 左侧文件夹浏览器（仅当更新矩形与之相交时重绘）
   if(g_folderOpen){
     RECT sbrc={0,eTop,leftBar(),rc.bottom};
@@ -2075,14 +2113,14 @@ void toggleFind(){
     InvalidateRect(g_hwnd,NULL,TRUE);
     return;
   }
-  int ew=240, eh=20, ey=TAB_H+5;
+  int ew=240, eh=20, ey=MENU_H+TAB_H+5;
   int ex=leftBar()+g_gutterW+28; // 左侧留出放大镜图标位置（随侧栏右移）
   g_hFind=CreateWindow(L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL|ES_WANTRETURN,
                         ex,ey,ew,eh,g_hwnd,(HMENU)2001,g_hInst,NULL);
   // 子类化输入框：捕获回车/ESC 的 WM_KEYDOWN，避免焦点丢失到标题栏
   g_oldFindProc = (WNDPROC)SetWindowLongPtr(g_hFind, GWLP_WNDPROC, (LONG_PTR)FindEditProc);
   // 计算三个自绘按钮的命中矩形（位于输入框右侧）
-  int btnY=TAB_H+4, btnH=22, btnW=64;
+  int btnY=MENU_H+TAB_H+4, btnH=22, btnW=64;
   int nx=ex+ew+8;
   g_rPrev  ={nx,         btnY, nx+btnW,         btnY+btnH};
   g_rNext  ={nx+btnW+6,  btnY, nx+btnW+6+btnW,  btnY+btnH};
@@ -2215,37 +2253,39 @@ void closeTab(int i){
 // 菜单
 // ----------------------------------------------------------------------------
 // 创建主菜单：文件 / 编辑 / 视图（含语言子菜单）。菜单项 id 与 WM_COMMAND 中对应。
-void createMenu(HMENU& hMenu){
-  hMenu=CreateMenu();
-  HMENU hFile=CreatePopupMenu();
-  AppendMenu(hFile,MF_STRING,1001,L"打开...\tCtrl+O");
-  AppendMenu(hFile,MF_STRING,1007,L"打开文件夹...\tCtrl+Shift+O");
-  AppendMenu(hFile,MF_STRING,1004,L"新建标签\tCtrl+T");
-  AppendMenu(hFile,MF_STRING,1005,L"关闭标签\tCtrl+W");
-  AppendMenu(hFile,MF_STRING,1006,L"保存\tCtrl+S");
-  AppendMenu(hFile,MF_STRING,1008,L"关闭文件夹");
-  AppendMenu(hFile,MF_STRING,1002,L"设为默认打开程序");
-  AppendMenu(hFile,MF_SEPARATOR,0,NULL);
-  AppendMenu(hFile,MF_STRING,1003,L"退出");
-  AppendMenu(hMenu,MF_POPUP,(UINT_PTR)hFile,L"文件");
+// 注意：为让菜单栏能随主题变色，系统菜单条被废弃；这里只创建三个弹出菜单，
+//       菜单栏本身在客户区顶部自绘（drawMenuBar）。
+void createMenus(){
+  if(g_hMenuFile){ DestroyMenu(g_hMenuFile); g_hMenuFile=NULL; }
+  if(g_hMenuEdit){ DestroyMenu(g_hMenuEdit); g_hMenuEdit=NULL; }
+  if(g_hMenuView){ DestroyMenu(g_hMenuView); g_hMenuView=NULL; }
+  g_hMenuFile=CreatePopupMenu();
+  AppendMenu(g_hMenuFile,MF_STRING,1001,L"打开...\tCtrl+O");
+  AppendMenu(g_hMenuFile,MF_STRING,1007,L"打开文件夹...\tCtrl+Shift+O");
+  AppendMenu(g_hMenuFile,MF_STRING,1004,L"新建标签\tCtrl+T");
+  AppendMenu(g_hMenuFile,MF_STRING,1005,L"关闭标签\tCtrl+W");
+  AppendMenu(g_hMenuFile,MF_STRING,1006,L"保存\tCtrl+S");
+  AppendMenu(g_hMenuFile,MF_STRING,1008,L"关闭文件夹");
+  AppendMenu(g_hMenuFile,MF_STRING,1002,L"设为默认打开程序");
+  AppendMenu(g_hMenuFile,MF_SEPARATOR,0,NULL);
+  AppendMenu(g_hMenuFile,MF_STRING,1003,L"退出");
 
-  HMENU hEdit=CreatePopupMenu();
-  AppendMenu(hEdit,MF_STRING,1101,L"复制\tCtrl+C");
-  AppendMenu(hEdit,MF_STRING,1102,L"全选\tCtrl+A");
-  AppendMenu(hEdit,MF_STRING,1103,L"查找\tCtrl+F");
-  AppendMenu(hMenu,MF_POPUP,(UINT_PTR)hEdit,L"编辑");
+  g_hMenuEdit=CreatePopupMenu();
+  AppendMenu(g_hMenuEdit,MF_STRING,1101,L"复制\tCtrl+C");
+  AppendMenu(g_hMenuEdit,MF_STRING,1102,L"全选\tCtrl+A");
+  AppendMenu(g_hMenuEdit,MF_STRING,1103,L"查找\tCtrl+F");
 
-  HMENU hView=CreatePopupMenu();
+  g_hMenuView=CreatePopupMenu();
   HMENU hTheme=CreatePopupMenu();
   AppendMenu(hTheme,MF_STRING,1250,L"One Dark Pro");
   AppendMenu(hTheme,MF_STRING,1251,L"One Light");
   AppendMenu(hTheme,MF_STRING,1252,L"VS Code");
   AppendMenu(hTheme,MF_STRING,1253,L"IntelliJ IDEA");
   AppendMenu(hTheme,MF_STRING,1254,L"极致黑");
-  AppendMenu(hView,MF_POPUP,(UINT_PTR)hTheme,L"主题");
-  AppendMenu(hView,MF_STRING,1202,L"自动换行");
-  AppendMenu(hView,MF_STRING,1203,L"字体 +");
-  AppendMenu(hView,MF_STRING,1204,L"字体 -");
+  AppendMenu(g_hMenuView,MF_POPUP,(UINT_PTR)hTheme,L"主题");
+  AppendMenu(g_hMenuView,MF_STRING,1202,L"自动换行");
+  AppendMenu(g_hMenuView,MF_STRING,1203,L"字体 +");
+  AppendMenu(g_hMenuView,MF_STRING,1204,L"字体 -");
   HMENU hLang=CreatePopupMenu();
   AppendMenu(hLang,MF_STRING,1300,L"自动");
   AppendMenu(hLang,MF_STRING,1301,L"纯文本");
@@ -2261,23 +2301,79 @@ void createMenu(HMENU& hMenu){
   AppendMenu(hLang,MF_STRING,1311,L"Java");
   AppendMenu(hLang,MF_STRING,1312,L"ASPX");
   AppendMenu(hLang,MF_STRING,1313,L"XML");
-  AppendMenu(hView,MF_POPUP,(UINT_PTR)hLang,L"语言");
-  AppendMenu(hMenu,MF_POPUP,(UINT_PTR)hView,L"视图");
+  AppendMenu(g_hMenuView,MF_POPUP,(UINT_PTR)hLang,L"语言");
 }
-// 菜单弹出前（WM_INITMENU）刷新勾选状态：当前语言项、自动换行项打勾。
-void checkMenu(HMENU hMenu){
+// 刷新三个弹出菜单的勾选状态：当前语言项、自动换行项、主题项。
+void checkMenus(){
   UINT langMap[]={1300,1301,1302,1303,1304,1305,1306,1307,1308,1309,1310,1311,1312,1313};
   int idx=0;
   if(g_lang==L"auto")idx=0; else if(g_lang==L"txt")idx=1; else if(g_lang==L"csharp")idx=2;
   else if(g_lang==L"sql")idx=3; else if(g_lang==L"html")idx=4; else if(g_lang==L"js")idx=5;
   else if(g_lang==L"json")idx=6; else if(g_lang==L"python")idx=7; else if(g_lang==L"css")idx=8;
   else if(g_lang==L"c")idx=9; else if(g_lang==L"cpp")idx=10; else if(g_lang==L"java")idx=11; else if(g_lang==L"aspx")idx=12; else if(g_lang==L"xml")idx=13;
-  HMENU hView=GetSubMenu(hMenu,2);   // 视图菜单是第 3 个（索引 2）
-  HMENU hTheme=GetSubMenu(hView,0);  // 主题子菜单（视图内第 1 项，索引 0）
-  HMENU hLang=GetSubMenu(hView,4);   // 语言子菜单（视图内第 5 项，索引 4）
+  HMENU hTheme=GetSubMenu(g_hMenuView,0);  // 主题子菜单（视图内第 1 项，索引 0）
+  HMENU hLang =GetSubMenu(g_hMenuView,3);   // 语言子菜单（视图内第 4 项，索引 3）
   for(int i=0;i<14;i++) CheckMenuItem(hLang,langMap[i],(i==idx)?MF_CHECKED:MF_UNCHECKED);
-  CheckMenuItem(hView,1202,g_wrap?MF_CHECKED:MF_UNCHECKED); // 自动换行勾选
-  for(int i=0;i<5;i++) CheckMenuItem(hTheme,1250+i,(i==g_themeIdx)?MF_CHECKED:MF_UNCHECKED); // 当前主题勾选
+  for(int i=0;i<NTHEMES;i++) CheckMenuItem(hTheme,1250+i,(i==g_themeIdx)?MF_CHECKED:MF_UNCHECKED);
+  CheckMenuItem(g_hMenuView,1202,g_wrap?MF_CHECKED:MF_UNCHECKED); // 自动换行勾选
+}
+
+// ----------------------------------------------------------------------------
+// 顶部自绘菜单栏
+// ----------------------------------------------------------------------------
+static const wchar_t* g_menuLabels[3]={L"文件",L"编辑",L"视图"};
+static const int g_menuWidths[3]={48,48,48}; // 暂定等宽，drawMenuBar 内按文字实际测量
+
+int menuBarHit(int x, const RECT& rc){
+  int x0=8;
+  for(int i=0;i<3;i++){
+    int w=g_menuRects[i].right-g_menuRects[i].left; // 实际宽度由 drawMenuBar 写入
+    if(x>=g_menuRects[i].left && x<g_menuRects[i].right) return i;
+  }
+  return -1;
+}
+
+void drawMenuBar(HDC mem, const RECT& rc){
+  // 背景：使用主题标题栏/菜单栏色
+  RECT mbr={0,0,rc.right,MENU_H};
+  HBRUSH b=CreateSolidBrush(TH.menuBarBg); FillRect(mem,&mbr,b); DeleteObject(b);
+  // 底部分隔线
+  HPEN sp=CreatePen(PS_SOLID,1,TH.menuBarDivider); HPEN op=(HPEN)SelectObject(mem,sp);
+  MoveToEx(mem,0,MENU_H-1,NULL); LineTo(mem,rc.right,MENU_H-1);
+  SelectObject(mem,op); DeleteObject(sp);
+
+  SetBkMode(mem,TRANSPARENT);
+  HFONT oldF=(HFONT)SelectObject(mem,g_sideFont?g_sideFont:g_hFont);
+  int x0=8;
+  for(int i=0;i<3;i++){
+    SIZE sz; GetTextExtentPoint32(mem,g_menuLabels[i],(int)wcslen(g_menuLabels[i]),&sz);
+    int w=sz.cx+20; int h=MENU_H;
+    g_menuRects[i]={x0,0,x0+w,h};
+    bool hover=(g_menuHover==i||g_menuActive==i);
+    if(hover){
+      HBRUSH hb=CreateSolidBrush(TH.menuBarHover); FillRect(mem,&g_menuRects[i],hb); DeleteObject(hb);
+    }
+    SetTextColor(mem, hover?TH.menuBarTextHover:TH.menuBarText);
+    RECT tr=g_menuRects[i];
+    DrawText(mem,g_menuLabels[i],(int)wcslen(g_menuLabels[i]),&tr,DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+    x0+=w;
+  }
+  if(oldF) SelectObject(mem,oldF);
+}
+
+void showMenuPopup(int idx, HWND hwnd, const RECT& rc){
+  if(idx<0||idx>2) return;
+  HMENU popup=(idx==0)?g_hMenuFile:(idx==1)?g_hMenuEdit:g_hMenuView;
+  checkMenus();
+  POINT pt={g_menuRects[idx].left, MENU_H};
+  ClientToScreen(hwnd,&pt);
+  g_menuActive=idx;
+  UINT flags=TPM_LEFTALIGN|TPM_TOPALIGN|TPM_LEFTBUTTON;
+  // 自绘菜单栏没有系统菜单条，需要手动让弹出菜单在失去焦点/点击外部时消失；TrackPopupMenu 已处理。
+  TrackPopupMenu(popup,flags,pt.x,pt.y,0,hwnd,NULL);
+  g_menuActive=-1;
+  g_menuHover=-1;
+  RECT rr={0,0,rc.right,MENU_H}; InvalidateRect(hwnd,&rr,FALSE); // 关闭菜单后重绘菜单栏
 }
 
 // ----------------------------------------------------------------------------
@@ -2631,8 +2727,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       int sx=(int)(short)LOWORD(lp), sy=(int)(short)HIWORD(lp); // 屏幕坐标
       POINT pt={sx,sy}; ScreenToClient(hwnd,&pt);
       int x=pt.x, y=pt.y;
-      // 标签栏区域：按右击位置定位标签，弹出标签菜单
-      if(y<TAB_H){
+      // 菜单栏/标签栏区域：按右击位置定位标签，弹出标签菜单
+      if(y<MENU_H+TAB_H){
         int idx=tabIndexAt(x);
         if(idx>=0) showTabMenu(hwnd,sx,sy,idx);
         return 0;
@@ -2656,8 +2752,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         ensureFont(); buildVisual(); updateScroll(); InvalidateRect(hwnd,NULL,TRUE); updateCaretPos();
         return 0;
       }
-      // 光标在标签栏上：水平滚动标签条
-      if(pt.y<TAB_H){
+      // 光标在菜单栏/标签栏上：水平滚动标签条
+      if(pt.y<MENU_H+TAB_H){
         int d=GET_WHEEL_DELTA_WPARAM(wp);
         g_tabScroll += (d>0? 1 : -1) * 60;
         clampTabScroll();
@@ -2688,20 +2784,26 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       }
       return TRUE;
     }
-    case WM_INITMENU: checkMenu((HMENU)wp); return 0;
     case WM_PAINT: paint(); return 0;
     case WM_ERASEBKGND: return 1; // 由 paint 自己画背景，禁止系统擦除（避免闪烁）
     case WM_SETFOCUS: updateCaretPos(); return 0;
     case WM_KILLFOCUS: DestroyCaret(); return 0;
     case WM_LBUTTONDOWN:{
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
+      // 顶部自绘菜单栏
+      if(y<MENU_H){
+        RECT rc; GetClientRect(hwnd,&rc);
+        int idx=menuBarHit(x,rc);
+        if(idx>=0){ showMenuPopup(idx,hwnd,rc); return 0; }
+        return 0;
+      }
       // 标签栏区域：判断点中“新建”按钮、关闭按钮还是切换标签（标签宽度按名称动态计算）
-      if(y<TAB_H){
+      if(y<MENU_H+TAB_H){
         RECT rc; GetClientRect(hwnd,&rc);
         int plusX=rc.right-PLUS_W;
         POINT pt={x,y};
         // “新建标签”按钮（+）钉在最右侧，始终可见
-        RECT pr={plusX+2,2,plusX+PLUS_W-2,TAB_H-2};
+        RECT pr={plusX+2,MENU_H+2,plusX+PLUS_W-2,MENU_H+TAB_H-2};
         if(PtInRect(&pr,pt)){ std::wstring p=openFileDialog(); if(!p.empty()) openInNewTab(p); return 0; }
         int stripRight=rc.right-PLUS_W;
         int cx=TAB_X0-g_tabScroll;
@@ -2711,7 +2813,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           if(cx+w<=0){ cx+=w; continue; }   // 完全在可视区左侧外
           if(cx>=stripRight) break;          // 已超出条带右界
           if(x>=cx && x<cx+w){
-            RECT cr={cx+w-TAB_CLOSE_W,4,cx+w-4,TAB_H-4};
+            RECT cr={cx+w-TAB_CLOSE_W,MENU_H+4,cx+w-4,MENU_H+TAB_H-4};
             if(PtInRect(&cr,pt)){ closeTab(i); return 0; } // 点中关闭 ×
             switchTab(i); return 0;                        // 否则切换标签
           }
@@ -2720,7 +2822,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
       }
       // 侧栏右缘拖动调宽（命中热区 [lb-1, lb+3]，避开树滚动条与行点击）
-      if(g_folderOpen && y>=TAB_H){
+      if(g_folderOpen && y>=MENU_H+TAB_H){
         int lb=leftBar();
         if(x>=lb-1 && x<=lb+3){
           g_sidebarResizing=true; g_sidebarResizeStartX=x; g_sidebarResizeStartW=g_sidebarW;
@@ -2730,7 +2832,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       // 左侧文件夹树区域（在标签栏下方、查找条/编辑器左侧）
       if(g_folderOpen && x<leftBar() && y>=editorTop()){ sidebarDown(x,y); return 0; }
       // 查找条区域（标签栏与编辑区之间）：命中自绘按钮或保持焦点在输入框
-      if(g_hFind && x>=leftBar() && y>=TAB_H && y<TAB_H+FIND_H){
+      if(g_hFind && x>=leftBar() && y>=MENU_H+TAB_H && y<MENU_H+TAB_H+FIND_H){
         POINT pt={x,y};
         if(PtInRect(&g_rClose,pt)){ g_findPress=3; toggleFind(); return 0; }
         if(PtInRect(&g_rPrev,pt)){ g_findPress=1; doFind(false); SetFocus(g_hFind); InvalidateRect(hwnd,NULL,TRUE); return 0; }
@@ -2759,6 +2861,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSEMOVE:{
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
+      RECT mrc; GetClientRect(hwnd,&mrc);
+      // 顶部自绘菜单栏悬停态
+      if(y<MENU_H){
+        int h=menuBarHit(x,mrc);
+        if(h!=g_menuHover){ g_menuHover=h; TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,g_hwnd,0}; TrackMouseEvent(&tme); RECT rr={0,0,mrc.right,MENU_H}; InvalidateRect(hwnd,&rr,FALSE); }
+        SetCursor(LoadCursor(NULL,IDC_ARROW));
+        return 0;
+      }
       // 正在拖动侧栏右缘调宽
       if(g_sidebarResizing){
         int dx=x-g_sidebarResizeStartX;
@@ -2788,20 +2898,20 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       // 查找条按钮悬停态跟踪（仅编辑器区域内）
       if(g_hFind){
         int h=0; POINT pt={x,y};
-        if(x>=leftBar() && y>=TAB_H && y<TAB_H+FIND_H){
+        if(x>=leftBar() && y>=MENU_H+TAB_H && y<MENU_H+TAB_H+FIND_H){
           if(PtInRect(&g_rPrev,pt))h=1; else if(PtInRect(&g_rNext,pt))h=2; else if(PtInRect(&g_rClose,pt))h=3;
         }
-        if(h!=g_findHover){ g_findHover=h; TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,g_hwnd,0}; TrackMouseEvent(&tme); RECT rc; GetClientRect(hwnd,&rc); RECT br={leftBar(),TAB_H,rc.right,TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
+        if(h!=g_findHover){ g_findHover=h; TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,g_hwnd,0}; TrackMouseEvent(&tme); RECT rc; GetClientRect(hwnd,&rc); RECT br={leftBar(),MENU_H+TAB_H,rc.right,MENU_H+TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
       }
       // 悬停在侧栏右缘：显示左右调整光标（并跳过树行高亮）
-      if(g_folderOpen && y>=TAB_H){
+      if(g_folderOpen && y>=MENU_H+TAB_H){
         int lb=leftBar();
         if(x>=lb-1 && x<=lb+3){ SetCursor(LoadCursor(NULL,IDC_SIZEWE)); return 0; }
       }
       // 侧栏悬停高亮（目录/文件行与关闭按钮）
       if(g_folderOpen && x<leftBar() && y>=editorTop()){ sidebarMove(x,y); return 0; }
       if(wp & MK_LBUTTON){
-        if(y<TAB_H) return 0;
+        if(y<MENU_H+TAB_H) return 0;
         // 选区拖到编辑区边缘时自动水平滚动
         RECT r; GetClientRect(hwnd,&r);
         int lb=leftBar();
@@ -2845,20 +2955,21 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_LBUTTONUP:{
       if(g_sidebarResizing){ g_sidebarResizing=false; ReleaseCapture(); return 0; }
       if(g_treeDrag){ g_treeDrag=false; ReleaseCapture(); return 0; }
-      if(g_findPress){ g_findPress=0; RECT rc; GetClientRect(hwnd,&rc); RECT br={0,TAB_H,rc.right,TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
+      if(g_findPress){ g_findPress=0; RECT rc; GetClientRect(hwnd,&rc); RECT br={0,MENU_H+TAB_H,rc.right,MENU_H+TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
       ReleaseCapture(); return 0;
     }
     case WM_MOUSELEAVE:{
       // 鼠标离开窗口：清除查找条按钮与侧栏的悬停高亮
-      if(g_findHover){ g_findHover=0; RECT rc; GetClientRect(hwnd,&rc); RECT br={leftBar(),TAB_H,rc.right,TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
+      if(g_menuHover!=-1){ g_menuHover=-1; RECT rc; GetClientRect(hwnd,&rc); RECT rr={0,0,rc.right,MENU_H}; InvalidateRect(hwnd,&rr,FALSE); }
+      if(g_findHover){ g_findHover=0; RECT rc; GetClientRect(hwnd,&rc); RECT br={leftBar(),MENU_H+TAB_H,rc.right,MENU_H+TAB_H+FIND_H}; InvalidateRect(hwnd,&br,TRUE); }
       if(g_sidebarHover!=-1 || g_sideHoverBtn){ g_sidebarHover=-1; g_sideHoverBtn=0; InvalidateRect(hwnd,NULL,TRUE); }
       return 0;
     }
     case WM_LBUTTONDBLCLK:{
       // 双击：把光标位置的“整词”选中，并高亮标记文档中所有相同分词
       int x=(int)LOWORD(lp), y=(int)HIWORD(lp);
-      if(y<TAB_H) return 0;                                   // 标签栏不处理
-      if(g_hFind && y<TAB_H+FIND_H) return 0;                 // 查找条不处理
+      if(y<MENU_H+TAB_H) return 0;                            // 菜单栏+标签栏不处理
+      if(g_hFind && y<MENU_H+TAB_H+FIND_H) return 0;          // 查找条不处理
       if(x<leftBar()+g_gutterW) return 0;
       int ey=y-editorTop();
       int v=ey/g_lineH + g_topLine;
@@ -2887,6 +2998,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_KEYDOWN:{
       bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
       bool shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+      bool alt =(GetKeyState(VK_MENU)&0x8000)!=0;
+      // Alt+F/E/V：展开自绘菜单栏的对应弹出菜单
+      if(alt && !ctrl && !shift){
+        RECT rc; GetClientRect(hwnd,&rc);
+        if(wp=='F'){ showMenuPopup(0,hwnd,rc); return 0; }
+        else if(wp=='E'){ showMenuPopup(1,hwnd,rc); return 0; }
+        else if(wp=='V'){ showMenuPopup(2,hwnd,rc); return 0; }
+      }
       // 组合键：Ctrl+O/T/W/F/C/A 与 Ctrl+Tab 切换标签
       if(ctrl){
         if(wp=='O'){
@@ -2958,6 +3077,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       else { g_anchorOff=g_caretOff; g_selStart=-1; g_selEnd=-1; } // 无 Shift：取消选区，锚点跟随
       findMatch(); setCaret(np);
       return 0;
+    }
+    case WM_SYSKEYDOWN:{
+      // 拦截 Alt+F/E/V，避免被系统菜单抢走；其它系统键交给默认处理
+      bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+      bool shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+      if(!ctrl && !shift && (wp=='F' || wp=='E' || wp=='V')){
+        RECT rc; GetClientRect(hwnd,&rc);
+        int idx=(wp=='F')?0:(wp=='E')?1:2;
+        showMenuPopup(idx,hwnd,rc);
+        return 0;
+      }
+      return DefWindowProc(hwnd,msg,wp,lp);
     }
     case WM_CHAR:{
       wchar_t ch=(wchar_t)wp;
@@ -3176,13 +3307,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
   WNDCLASS wc={0};
   wc.style=CS_DBLCLKS; // 启用双击消息（WM_LBUTTONDBLCLK），用于双击选词/高亮
   wc.lpfnWndProc=WndProc; wc.hInstance = hInstance; wc.hCursor=LoadCursor(NULL,IDC_IBEAM);
-  wc.lpszClassName=WNDCLASS_NAME; wc.hbrBackground=(HBRUSH)GetStockObject(WHITE_BRUSH);
+  wc.lpszClassName=WNDCLASS_NAME; wc.hbrBackground=CreateSolidBrush(TH.bg); // 用主题背景色，避免窗口拉伸/非客户区出现白闪
   RegisterClass(&wc);
   g_hwnd=CreateWindowEx(WS_EX_ACCEPTFILES,WNDCLASS_NAME,L"LiteReader",
     WS_OVERLAPPEDWINDOW|WS_VSCROLL|WS_HSCROLL,
     CW_USEDEFAULT,CW_USEDEFAULT,900,640,NULL,NULL,hInstance,NULL);
-  HMENU hMenu; createMenu(hMenu); SetMenu(g_hwnd,hMenu);
+  createMenus();       // 创建自绘菜单栏的三个弹出菜单（不再挂系统菜单条）
   setAppIcon(g_hwnd); // 运行时绘制 “LR” 图标（不引用任何图片文件，保持单 cpp）
+
+  // 在窗口显示前先把非客户区（标题栏、边框）设为当前主题色
+  applyThemeToFrame();
 
   // 恢复上次窗口布局（位置/大小，以及是否最大化）
   if(g_cfgMax==1){
