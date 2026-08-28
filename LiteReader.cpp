@@ -65,6 +65,7 @@ HWND g_hwnd = NULL;       // 主窗口句柄
 HWND g_hFind = NULL;      // 查找输入框（NULL 表示未显示查找条）
 // 查找条上的“上一项/下一项/关闭”改为“自绘区域”（非子控件），以下为它们的命中矩形与交互状态
 const int FIND_H = 30;                             // 查找条高度（像素）
+const int SB_H = 22;                              // 底部状态栏高度（像素）
 RECT g_rPrev = { 0 }, g_rNext = { 0 }, g_rClose = { 0 }; // 三个按钮的命中矩形
 int g_findHover = 0; // 当前鼠标悬停的按钮：0=无 1=上一项 2=下一项 3=关闭
 int g_findPress = 0; // 当前按下的按钮（同上枚举），用于按下态绘制
@@ -183,6 +184,7 @@ LineBmp& getLineBmp(int v); // 取（或渲染并缓存）视觉行 v 的离屏�
 std::wstring g_filePath;       // 当前文档的磁盘路径
 std::wstring g_lang = L"auto"; // 语言选择（auto / txt / csharp / ...）
 int g_enc = 0;        // 当前文档编码：0=UTF-8无BOM 1=UTF-8 BOM 2=UTF-16LE 3=UTF-16BE 4=ANSI(GBK)
+int g_charCount = 0;   // 当前文档字符数（按码点计，排除代理对低项），供状态栏显示
 bool g_dirty = false; // 文档是否已修改（未保存），标题追加 “ *” 提示
 
 // 代码补全（关键字 / 括号配对 / 函数补全）。默认关闭，由 .ini 的 autocomplete 开关控制。
@@ -267,6 +269,7 @@ struct Doc {
     std::vector<Visual> visual;
     int visualCount = 0;
     bool dirty = false; // 该文档是否已修改（未保存）
+    int enc = 0;        // 该文档编码（0=UTF-8无BOM 1=UTF-8 BOM 2=UTF-16LE 3=UTF-16BE 4=ANSI/GBK），按文档保存避免多标签串味
     std::wstring title; // 预留标题字段（当前用 filePath 派生，未单独使用）
     // 撤销/重做栈（操作式历史），按文档保存，切换标签时随快照迁移
     std::vector<EditStep> undoStack;
@@ -308,6 +311,7 @@ void snapshotTo(int i) {
     d.topLine = g_topLine;
     d.scrollX = g_scrollX;
     d.dirty = g_dirty;
+    d.enc = g_enc; // 编码随文档快照保存，切换标签后用对应文档的编码写回，避免串味乱码
     d.visual = g_visual;
     d.visualCount = g_visualCount;
     d.undoStack = g_undoStack;
@@ -342,6 +346,7 @@ void restoreFrom(int i) {
     g_topLine = d.topLine;
     g_scrollX = d.scrollX;
     g_dirty = d.dirty;
+    g_enc = d.enc; // 切回该文档时恢复其编码，保存即用正确编码写回
     g_visual = d.visual;
     g_visualCount = d.visualCount;
     g_undoStack = d.undoStack;
@@ -1688,13 +1693,17 @@ void rebuildLines() {
     int i = 0;
     int line = 0;
     g_lineStart.push_back(0); // 第 0 行从偏移 0 开始
+    int cc = 0; // 码点计数（排除代理对低项，避免 emoji 等被算成 2 个字符），含换行符
     for (i = 0; i < n; i++) {
-        if (g_text[i] == L'\n') {
+        wchar_t c = g_text[i];
+        if (c < 0xDC00 || c > 0xDFFF) cc++; // 跳过 UTF-16 低代理项
+        if (c == L'\n') {
             g_lineLen.push_back(i - g_lineStart[line]); // 记录当前行长度（不含 \n）
             line++;
             g_lineStart.push_back(i + 1); // 下一行从 \n 之后开始
         }
     }
+    g_charCount = cc; // 字符数（码点）供状态栏显示
     g_lineLen.push_back(n - g_lineStart.back()); // 最后一行（可能没有末尾换行）
     g_lineCount = (int)g_lineStart.size();
     g_lineDepth.assign(g_lineCount, 0);
@@ -1957,7 +1966,7 @@ void setCaret(int off) {
     } // 退而求其次按行找
     RECT r;
     GetClientRect(g_hwnd, &r);
-    int edH = r.bottom - editorTop();
+    int edH = r.bottom - editorTop() - SB_H;
     int visH = edH / g_lineH; // 可见视觉行数
     if (vline >= 0) {
         // 垂直滚动：若光标在可见区上方则顶到它，在下方则翻页使其可见
@@ -2037,7 +2046,7 @@ void updateScroll() {
     if (g_visualCount > 0 && g_topLine > g_visualCount - 1) g_topLine = g_visualCount - 1;
     RECT r;
     GetClientRect(g_hwnd, &r);
-    int edH = r.bottom - editorTop();
+    int edH = r.bottom - editorTop() - SB_H;
     if (edH < 1) edH = 1;
     int visH = edH / g_lineH;
     SCROLLINFO si = { sizeof(si) };
@@ -3022,7 +3031,7 @@ static void scrollByLines(int delta) {
     RECT r;
     GetClientRect(g_hwnd, &r);
     int eTop = editorTop();
-    RECT sr = { leftBar(), eTop, r.right, r.bottom };
+    RECT sr = { leftBar(), eTop, r.right, r.bottom - SB_H }; // 滚动区域止于状态栏上方，避免状态栏被滚动
     ScrollWindowEx(g_hwnd, 0, dy, &sr, &sr, NULL, NULL, SW_INVALIDATE);
     updateScroll();
     updateCaretPos();
@@ -3057,6 +3066,45 @@ static void drawFindBar(HDC mem, RECT rc) {
     drawFindCloseBtn(mem, g_rClose, g_findHover == 3, g_findPress == 3);
 }
 
+// 底部状态栏：右对齐显示 字符数 / 行数 / 编码格式 / 当前时间。
+// 复用顶部菜单栏配色（menuBar*），视觉上与顶部栏呼应。
+void drawStatusBar(HDC mem, const RECT& rc) {
+    RECT r = { 0, rc.bottom - SB_H, rc.right, rc.bottom };
+    HBRUSH b = CreateSolidBrush(TH.menuBarBg);
+    FillRect(mem, &r, b);
+    DeleteObject(b);
+    // 顶部分隔线
+    HPEN p = CreatePen(PS_SOLID, 1, TH.menuBarDivider);
+    HPEN op = (HPEN)SelectObject(mem, p);
+    MoveToEx(mem, 0, r.top, NULL);
+    LineTo(mem, rc.right, r.top);
+    SelectObject(mem, op);
+    DeleteObject(p);
+
+    // 编码格式标签（与 g_enc 语义一致：0=UTF-8 1=UTF-8 BOM 2=UTF-16LE 3=UTF-16BE 4=ANSI/GBK）
+    const wchar_t* encName;
+    switch (g_enc) {
+        case 1: encName = L"UTF-8 BOM"; break;
+        case 2: encName = L"UTF-16 LE"; break;
+        case 3: encName = L"UTF-16 BE"; break;
+        case 4: encName = L"ANSI (GBK)"; break;
+        default: encName = L"UTF-8"; break;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t timeBuf[16];
+    _snwprintf(timeBuf, 15, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    wchar_t info[160];
+    _snwprintf(info, 159, L"字符 %d    行 %d    编码 %s    时间 %s", g_charCount, g_lineCount,
+        encName, timeBuf);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, TH.menuBarText);
+    RECT tr = { 8, r.top, rc.right - 8, rc.bottom };
+    DrawText(mem, info, (int)wcslen(info), &tr,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SetBkMode(mem, OPAQUE);
+}
+
 void paint() {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(g_hwnd, &ps);
@@ -3067,6 +3115,7 @@ void paint() {
         return;
     }
     int eTop = editorTop(); // 编辑区从标签栏（及可能的查找条）下方开始
+    int edBot = rc.bottom - SB_H; // 编辑区底部 = 窗口底 - 状态栏高度
     RECT ur = ps.rcPaint;   // 仅本次需要重绘的更新矩形
     ensureBuf(rc.right, rc.bottom);
     HDC mem = g_bufDC;
@@ -3077,7 +3126,7 @@ void paint() {
     COLORREF gb = gutterBg();
 
     // 编辑器文本带：仅重绘与更新矩形相交的部分（滚动/拖选只触及少量行）
-    int y0 = max((int)ur.top, eTop), y1 = min((int)ur.bottom, (int)rc.bottom);
+    int y0 = max((int)ur.top, eTop), y1 = min((int)ur.bottom, edBot);
     if (y1 > y0) {
         RECT bgr = { 0, y0, rc.right, y1 };
         HBRUSH bgBr = CreateSolidBrush(bg);
@@ -3148,10 +3197,20 @@ void paint() {
         RECT mbrc = { 0, 0, rc.right, MENU_H };
         if (rectsIntersect(ur, mbrc)) drawMenuBar(mem, mbrc);
     }
-    // 左侧文件夹浏览器（仅当更新矩形与之相交时重绘）
+    // 左侧文件夹浏览器（仅当更新矩形与之相交时重绘）；裁剪到状态栏上方，避免溢出到状态栏
     if (g_folderOpen) {
-        RECT sbrc = { 0, eTop, leftBar(), rc.bottom };
-        if (rectsIntersect(ur, sbrc)) drawSidebar(mem, rc);
+        RECT sbrc = { 0, eTop, leftBar(), edBot };
+        if (rectsIntersect(ur, sbrc)) {
+            int sv = SaveDC(mem);
+            IntersectClipRect(mem, sbrc.left, sbrc.top, sbrc.right, sbrc.bottom);
+            drawSidebar(mem, rc);
+            RestoreDC(mem, sv);
+        }
+    }
+    // 底部状态栏（仅当更新矩形与之相交时重绘：载入/编辑/每秒时钟会触发）
+    {
+        RECT stbrc = { 0, rc.bottom - SB_H, rc.right, rc.bottom };
+        if (rectsIntersect(ur, stbrc)) drawStatusBar(mem, rc);
     }
 
     // 仅把更新矩形区域从内存 DC 拷到屏幕（不再整屏 BitBlt）
@@ -3230,7 +3289,7 @@ std::vector<BYTE> encodeBytes(const std::wstring& w, int enc) {
     }
     else if (enc == 1) { // UTF-8 + BOM
         BYTE bom[] = { 0xEF, 0xBB, 0xBF };
-        out.insert(out.end(), bom, bom + 2);
+        out.insert(out.end(), bom, bom + 3); // 注意：bom 为 3 字节，必须写满 3 字节，否则 BOM 截断会导致文件乱码
         int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
         std::string s;
         s.resize(n);
@@ -3270,6 +3329,8 @@ void loadFile(const std::wstring& path) {
     CloseHandle(h);
     g_filePath = path;
     g_text = decodeBytes(buf);
+    // 记录该文档编码，供保存时按原编码写回（多标签互不串味）
+    if (g_active >= 0 && g_active < (int)g_docs.size()) g_docs[g_active].enc = g_enc;
     g_funcDirty = true;
     g_undoStack.clear();
     g_redoStack.clear(); // 载入新文件：撤销/重做历史作废
@@ -3482,7 +3543,10 @@ void saveFile() {
         if (p.empty()) return;
         g_filePath = p;
     }
-    std::vector<BYTE> buf = encodeBytes(g_text, g_enc);
+    // 取“当前激活文档”的编码写回，避免多标签切换后 global g_enc 串味导致乱码
+    int enc = (g_active >= 0 && g_active < (int)g_docs.size()) ? g_docs[g_active].enc : g_enc;
+    g_enc = enc; // 同步到全局，保持与当前文档一致
+    std::vector<BYTE> buf = encodeBytes(g_text, enc);
     HANDLE h = CreateFile(g_filePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -4663,6 +4727,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ensureFont();
         buildVisual();
         updateScroll();
+        SetTimer(hwnd, 1, 1000, NULL); // 状态栏时钟：每秒刷新一次当前时间
         return 0;
     }
     case WM_DROPFILES: {
@@ -4698,7 +4763,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int pos = GetScrollPos(hwnd, SB_VERT);
         RECT r;
         GetClientRect(hwnd, &r);
-        int page = (r.bottom - editorTop()) / g_lineH;
+        int page = (r.bottom - editorTop() - SB_H) / g_lineH;
         int m = LOWORD(wp);
         if (m == SB_LINEUP)
             pos--;
@@ -5366,7 +5431,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_PRIOR: {
             RECT r;
             GetClientRect(hwnd, &r);
-            int page = (r.bottom - editorTop()) / g_lineH;
+            int page = (r.bottom - editorTop() - SB_H) / g_lineH;
             int v = -1;
             for (int q = 0; q < g_visualCount; q++)
                 if (g_visual[q].line == line) {
@@ -5381,7 +5446,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_NEXT: {
             RECT r;
             GetClientRect(hwnd, &r);
-            int page = (r.bottom - editorTop()) / g_lineH;
+            int page = (r.bottom - editorTop() - SB_H) / g_lineH;
             int v = -1;
             for (int q = 0; q < g_visualCount; q++)
                 if (g_visual[q].line == line) {
@@ -5624,7 +5689,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         saveConfig();
         DestroyWindow(hwnd);
         return 0;
+    case WM_TIMER: {
+        if (wp == 1) {
+            // 仅使状态栏区域失效，避免整屏重绘（每秒一次刷新时钟）
+            RECT r;
+            GetClientRect(hwnd, &r);
+            RECT sbr = { 0, r.bottom - SB_H, r.right, r.bottom };
+            InvalidateRect(hwnd, &sbr, TRUE);
+        }
+        return 0;
+    }
     case WM_DESTROY:
+        KillTimer(hwnd, 1);
         PostQuitMessage(0);
         return 0;
     }
